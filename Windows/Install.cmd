@@ -3,8 +3,18 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 title ESP32 Brightness Bridge Setup
 
-rem End-user installer. This package NEVER compiles anything on the user's PC.
-rem The developer must run build.bat before creating the release package.
+rem Works from either the developer folder or the clean end-user release.
+set "INSTALLSCRIPT=%~dp0install_agent.ps1"
+if not exist "%INSTALLSCRIPT%" set "INSTALLSCRIPT=%~dp0App\install_agent.ps1"
+
+if not exist "%INSTALLSCRIPT%" (
+    echo.
+    echo ERROR: Installation files are missing.
+    echo Please extract the complete ESP32 Brightness Bridge package and try again.
+    echo.
+    pause
+    exit /b 2
+)
 
 fltmc >nul 2>&1
 if errorlevel 1 (
@@ -19,22 +29,7 @@ echo   ESP32 Brightness Bridge - Install / Update
 echo ==============================================
 echo.
 
-if not exist "build\Esp32DisplayPowerAgent.exe" goto :missing
-if not exist "build\Esp32DisplayPowerBridge.exe" goto :missing
-
-goto :install
-
-:missing
-echo ERROR: Precompiled application files are missing.
-echo.
-echo This installer does not compile software on the user's computer.
-echo Please use the complete release package supplied by the developer.
-echo.
-pause
-exit /b 2
-
-:install
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_agent.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%INSTALLSCRIPT%"
 if errorlevel 1 goto :failed
 
 echo.
@@ -52,8 +47,7 @@ exit /b 0
 :failed
 echo.
 echo INSTALLATION FAILED.
-echo The installer has left automatic display control disabled or restored the
-echo backlight where possible. Review the message above before retrying.
+echo Automatic display control was not enabled unless the safety checks passed.
 echo.
 pause
 exit /b 1

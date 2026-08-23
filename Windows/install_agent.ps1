@@ -89,8 +89,13 @@ Write-Host "Interactive user: $targetUser"
 Remove-LegacyWmiProvider
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$srcAgent = Join-Path $root 'build\Esp32DisplayPowerAgent.exe'
-$srcCli = Join-Path $root 'build\Esp32DisplayPowerBridge.exe'
+$srcAgent = Join-Path $root 'bin\Esp32DisplayPowerAgent.exe'
+$srcCli = Join-Path $root 'bin\Esp32DisplayPowerBridge.exe'
+
+# Developer-folder fallback: build.bat still outputs to .\build.  The clean
+# end-user release uses App\bin and never compiles anything on the user's PC.
+if (-not (Test-Path $srcAgent)) { $srcAgent = Join-Path $root 'build\Esp32DisplayPowerAgent.exe' }
+if (-not (Test-Path $srcCli)) { $srcCli = Join-Path $root 'build\Esp32DisplayPowerBridge.exe' }
 if (-not (Test-Path $srcAgent)) { throw "Agent EXE not found: $srcAgent`nThe precompiled Agent EXE is missing. Use the complete release package supplied by the developer." }
 if (-not (Test-Path $srcCli)) { throw "CLI EXE not found: $srcCli`nThe precompiled CLI EXE is missing. Use the complete release package supplied by the developer." }
 
@@ -124,7 +129,8 @@ $supportFiles = @(
     'uninstall_agent.ps1',
     'emergency_recover.ps1',
     'health_check.ps1',
-    'README_FIRST.txt'
+    'README_FIRST.txt',
+    'README.txt'
 )
 foreach ($name in $supportFiles) {
     $source = Join-Path $root $name
@@ -224,7 +230,7 @@ try {
     $uninstallCommand = ('{0} /d /c ""{1}" /quiet"' -f $env:ComSpec, $installedUninstall)
     New-Item -Path $uninstallKey -Force | Out-Null
     New-ItemProperty -Path $uninstallKey -Name DisplayName -PropertyType String -Value 'ESP32 Brightness Bridge' -Force | Out-Null
-    New-ItemProperty -Path $uninstallKey -Name DisplayVersion -PropertyType String -Value '10.2' -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name DisplayVersion -PropertyType String -Value '10.3' -Force | Out-Null
     New-ItemProperty -Path $uninstallKey -Name Publisher -PropertyType String -Value 'ESP32 Display Project' -Force | Out-Null
     New-ItemProperty -Path $uninstallKey -Name InstallLocation -PropertyType String -Value $installDir -Force | Out-Null
     New-ItemProperty -Path $uninstallKey -Name DisplayIcon -PropertyType String -Value $dstAgent -Force | Out-Null

@@ -3,6 +3,19 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 title ESP32 Brightness Bridge Uninstaller
 
+rem Works both from the extracted release and from Program Files after install.
+set "UNINSTALLSCRIPT=%~dp0uninstall_agent.ps1"
+if not exist "%UNINSTALLSCRIPT%" set "UNINSTALLSCRIPT=%~dp0App\uninstall_agent.ps1"
+
+if not exist "%UNINSTALLSCRIPT%" (
+    echo.
+    echo ERROR: Uninstallation files are missing.
+    echo You can also uninstall from Windows Settings ^> Apps ^> Installed apps.
+    echo.
+    pause
+    exit /b 2
+)
+
 fltmc >nul 2>&1
 if errorlevel 1 (
     echo Requesting administrator permission...
@@ -20,7 +33,7 @@ echo   ESP32 Brightness Bridge - Uninstall
 echo ==============================================
 echo.
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0uninstall_agent.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%UNINSTALLSCRIPT%"
 set "RC=%ERRORLEVEL%"
 
 if /I "%~1"=="/quiet" exit /b %RC%
