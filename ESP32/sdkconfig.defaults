@@ -1,0 +1,10 @@
+# GPIO21 is ESP32-C3 UART0 TX by default, but this project uses GPIO21 as DDC SDA.
+# Keep application stdout/stderr off UART0 and use the native USB Serial/JTAG port.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_UART_CUSTOM=n
+CONFIG_ESP_CONSOLE_NONE=n
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Minimize second-stage bootloader UART output as well.
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y

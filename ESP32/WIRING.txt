@@ -1,0 +1,29 @@
+ESP32-C3 wiring
+================
+
+DDC / HDMI:
+  GPIO21  SDA
+  GPIO20  SCL
+
+Panel backlight:
+  GPIO5   PWM, 5 kHz
+
+Laptop keyboard matrix passive sensing:
+  GPIO6   Fn KSO
+  GPIO8   Fn KSI
+  GPIO10  F9 KSO
+  GPIO9   F10 KSO
+  GPIO7   F9/F10 shared KSI
+
+All keyboard pins are INPUT ONLY with ESP32 pullups/pulldowns disabled.
+The motherboard supplies the KSI pullups.
+
+IMPORTANT GPIO21 NOTE
+=====================
+GPIO21 is UART0 TX on ESP32-C3 by default. The supplied sdkconfig.defaults
+moves the application console to USB Serial/JTAG so UART0 does not interfere
+with DDC SDA after startup.
+
+If your board has an external USB-UART bridge physically wired to GPIO20/21,
+disconnect that bridge from those pins or use different DDC pins. A software
+setting cannot stop an external UART chip from electrically driving GPIO21.
