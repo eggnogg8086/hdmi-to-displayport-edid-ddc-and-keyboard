@@ -1,4 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
 #endif
@@ -54,35 +57,31 @@ static const GUID kGuidLidSwitchStateChange =
 { 0xba3e0f4d, 0xb817, 0x4094, { 0xa2, 0xd1, 0xd5, 0x63, 0x79, 0xe6, 0xa0, 0xf3 } };
 
 
-// Display power-plan subgroup = 7516B95F-F776-4464-8C53-06167F40CC99
-static const GUID kGuidVideoSubgroup =
-{ 0x7516b95f, 0xf776, 0x4464, { 0x8c, 0x53, 0x06, 0x16, 0x7f, 0x40, 0xcc, 0x99 } };
-
-// VIDEOIDLE / "Turn off display after" = 3C0BC021-C8A8-4E07-A973-6B14CBCB2B7E
-static const GUID kGuidVideoIdle =
-{ 0x3c0bc021, 0xc8a8, 0x4e07, { 0xa9, 0x73, 0x6b, 0x14, 0xcb, 0xcb, 0x2b, 0x7e } };
-
-// Laptop-like timeout sequence with an HDMI hold:
-//   T-8.0 s: after confirming no external ES_DISPLAY_REQUIRED request, acquire
-//            PowerRequestDisplayRequired so Windows cannot tear down
-//            the picture while our backlight sequence is running.
-//   T-5.0 s: temporarily dim to 50% of the saved user brightness.
-//   T-2.5 s: send VCP 0x10 = 0 so the ESP32 starts its local fade.
-//   +1.2 s : after the OFF command, release the display power request.
-//            At that point the backlight is already black, so Windows may
-//            remove the HDMI picture whenever its own idle logic decides to.
-static constexpr DWORD kDisplayHoldLeadMs = 5500;
-static constexpr DWORD kDimLeadMs = 5000;
-static constexpr DWORD kOffLeadMs = 2500;
-static constexpr DWORD kFadeGuardAfterOffMs = 1200;
-static constexpr DWORD kPreblankOffConfirmGraceMs = 2000;
-static constexpr DWORD kSuspendFadeGuardMs = 1000;
-
+// v10.8 predictive DIM-to-OFF policy.
+//
+// Windows is the sole authority for normal display power state.  The bridge:
+//   * never calls PowerCreateRequest / PowerSetRequest / PowerClearRequest;
+//   * never predicts from raw user-idle time;
+//   * may anticipate OFF only AFTER Windows itself reports DIM;
+//   * never creates a Windows power/execution-state hold.
+//
+// GUID_SESSION_DISPLAY_STATUS is authoritative for normal interactive-session
+// display transitions:
+//   PowerMonitorOn  (1) -> restore the user's saved nonzero brightness.
+//   PowerMonitorDim (2) -> temporary configurable dim and optional learned pre-OFF.
+//   PowerMonitorOff (0) -> authoritative VCP 0x10 = 0 and DIM->OFF learning sample.
+//
+// Suspend and lid-close remain independent best-effort OFF paths.
+// Shutdown/restart deliberately do NOT modify VCP 0x10: Windows may still need
+// the panel during shutdown/restart UI and the next boot transition.  Final
+// physical power-off is left to the laptop/ESP32 hardware-side DDC guard.
 static constexpr UINT_PTR kAgentTimerId = 1;
 static constexpr UINT kAgentTimerPeriodMs = 100;
-static constexpr ULONGLONG kBrightnessCacheIntervalMs = 5000;
-static constexpr ULONGLONG kPowerPlanRefreshIntervalMs = 5000;
-static constexpr ULONGLONG kStartupRecoveryRecentInputMs = 30000;
+static constexpr ULONGLONG kBrightnessCacheIntervalMs = 1000;
+static constexpr ULONGLONG kSettingsPollIntervalMs = 1000;
+static constexpr ULONGLONG kRestoreRetryIntervalMs = 500;
+static constexpr int kRestoreRetryMaxAttempts = 20;
+static constexpr ULONGLONG kStartupDisplayStateWaitMs = 3000;
 static constexpr ULONGLONG kLogRotateBytes = 2ULL * 1024ULL * 1024ULL;
 static constexpr int kPanicHotkeyId = 0x4553;
 
@@ -179,6 +178,113 @@ static void Log(const wchar_t* format, ...)
     }
 }
 
+
+static std::wstring GetSettingsPath()
+{
+    return GetLogDirectory() + L"\\settings.ini";
+}
+
+static DWORD ClampDword(DWORD value, DWORD minimum, DWORD maximum)
+{
+    return (std::max)(minimum, (std::min)(value, maximum));
+}
+
+struct PredictionSettings
+{
+    bool enabled = true;
+    bool learningEnabled = true;
+    bool requireLearnedSample = true;
+    bool checkDisplayRequired = true;
+    DWORD dimPercent = 50;
+    DWORD advanceMs = 1400;
+    DWORD preOffConfirmTimeoutMs = 2500;
+    DWORD fallbackDimToOffMs = 5000;
+    DWORD minimumPredictionDelayMs = 500;
+    DWORD minimumLearnIntervalMs = 1500;
+    DWORD maximumLearnIntervalMs = 15000;
+};
+
+static PredictionSettings ReadPredictionSettingsFromIni()
+{
+    PredictionSettings cfg{};
+    const std::wstring path = GetSettingsPath();
+
+    cfg.dimPercent = ClampDword(
+        GetPrivateProfileIntW(L"Display", L"DimPercent", 50, path.c_str()), 1, 100);
+
+    cfg.enabled = GetPrivateProfileIntW(
+        L"Prediction", L"Enabled", 1, path.c_str()) != 0;
+    cfg.learningEnabled = GetPrivateProfileIntW(
+        L"Prediction", L"LearningEnabled", 1, path.c_str()) != 0;
+    cfg.requireLearnedSample = GetPrivateProfileIntW(
+        L"Prediction", L"RequireLearnedSample", 1, path.c_str()) != 0;
+    cfg.checkDisplayRequired = GetPrivateProfileIntW(
+        L"Prediction", L"CheckDisplayRequired", 1, path.c_str()) != 0;
+    cfg.advanceMs = ClampDword(
+        GetPrivateProfileIntW(L"Prediction", L"AdvanceMs", 1400, path.c_str()), 0, 10000);
+    cfg.preOffConfirmTimeoutMs = ClampDword(
+        GetPrivateProfileIntW(L"Prediction", L"PreOffConfirmTimeoutMs", 2500, path.c_str()), 500, 10000);
+    cfg.fallbackDimToOffMs = ClampDword(
+        GetPrivateProfileIntW(L"Prediction", L"FallbackDimToOffMs", 5000, path.c_str()), 1000, 30000);
+    cfg.minimumPredictionDelayMs = ClampDword(
+        GetPrivateProfileIntW(L"Prediction", L"MinimumPredictionDelayMs", 500, path.c_str()), 100, 5000);
+    cfg.minimumLearnIntervalMs = ClampDword(
+        GetPrivateProfileIntW(L"Prediction", L"MinimumLearnIntervalMs", 1500, path.c_str()), 500, 30000);
+    cfg.maximumLearnIntervalMs = ClampDword(
+        GetPrivateProfileIntW(L"Prediction", L"MaximumLearnIntervalMs", 15000, path.c_str()),
+        cfg.minimumLearnIntervalMs, 60000);
+
+    return cfg;
+}
+
+static bool PredictionSettingsEqual(const PredictionSettings& a, const PredictionSettings& b)
+{
+    return a.enabled == b.enabled &&
+        a.learningEnabled == b.learningEnabled &&
+        a.requireLearnedSample == b.requireLearnedSample &&
+        a.checkDisplayRequired == b.checkDisplayRequired &&
+        a.dimPercent == b.dimPercent &&
+        a.advanceMs == b.advanceMs &&
+        a.preOffConfirmTimeoutMs == b.preOffConfirmTimeoutMs &&
+        a.fallbackDimToOffMs == b.fallbackDimToOffMs &&
+        a.minimumPredictionDelayMs == b.minimumPredictionDelayMs &&
+        a.minimumLearnIntervalMs == b.minimumLearnIntervalMs &&
+        a.maximumLearnIntervalMs == b.maximumLearnIntervalMs;
+}
+
+static DWORD LoadBridgeDword(const wchar_t* name, DWORD fallback)
+{
+    DWORD value = fallback;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\ESP32BrightnessBridge",
+            name,
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &value,
+            &size) != ERROR_SUCCESS) {
+        return fallback;
+    }
+    return value;
+}
+
+static void SaveBridgeDword(const wchar_t* name, DWORD value)
+{
+    HKEY key = nullptr;
+    DWORD disposition = 0;
+    if (RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\ESP32BrightnessBridge",
+            0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, &disposition) != ERROR_SUCCESS) {
+        return;
+    }
+
+    RegSetValueExW(key, name, 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+}
+
 static DWORD LoadSavedBrightness()
 {
     DWORD value = 50;
@@ -230,6 +336,70 @@ static void SaveBrightness(DWORD value)
         );
         RegCloseKey(key);
     }
+}
+
+
+static void SaveTemporaryDimState(bool active, DWORD value)
+{
+    HKEY key = nullptr;
+    DWORD disposition = 0;
+    LONG rc = RegCreateKeyExW(
+        HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\ESP32BrightnessBridge",
+        0,
+        nullptr,
+        0,
+        KEY_SET_VALUE,
+        nullptr,
+        &key,
+        &disposition);
+
+    if (rc != ERROR_SUCCESS) {
+        return;
+    }
+
+    const DWORD activeValue = active ? 1u : 0u;
+    RegSetValueExW(key, L"TemporaryDimActive", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&activeValue), sizeof(activeValue));
+
+    if (active && value > 0 && value <= 100) {
+        RegSetValueExW(key, L"TemporaryDimValue", 0, REG_DWORD,
+            reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    } else {
+        RegDeleteValueW(key, L"TemporaryDimValue");
+    }
+
+    RegCloseKey(key);
+}
+
+static bool LoadTemporaryDimState(DWORD& value)
+{
+    DWORD active = 0;
+    DWORD size = sizeof(active);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\ESP32BrightnessBridge",
+            L"TemporaryDimActive",
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &active,
+            &size) != ERROR_SUCCESS || active == 0) {
+        return false;
+    }
+
+    DWORD dimValue = 0;
+    size = sizeof(dimValue);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\ESP32BrightnessBridge",
+            L"TemporaryDimValue",
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &dimValue,
+            &size) != ERROR_SUCCESS || dimValue == 0 || dimValue > 100) {
+        return false;
+    }
+
+    value = dimValue;
+    return true;
 }
 
 struct DisplayTarget
@@ -362,6 +532,16 @@ public:
             return false;
         }
 
+        // A cloned/mirrored GDI monitor can expose more than one physical
+        // monitor handle. Dxva2 does not give us a stable device-path mapping
+        // for those handles, so choosing the first DDC-capable one could alter
+        // an external monitor instead of AUOD0A2. Fail open on ambiguity.
+        if (count != 1) {
+            Log(L"Refusing DDC control: GDI source %s exposes %lu physical monitors (ambiguous clone/mirror topology)",
+                target.gdiName.c_str(), count);
+            return false;
+        }
+
         monitors_.resize(count);
         if (!GetPhysicalMonitorsFromHMONITOR(ctx.hMonitor, count, monitors_.data())) {
             Log(L"GetPhysicalMonitorsFromHMONITOR failed: %lu", GetLastError());
@@ -419,6 +599,16 @@ public:
         return false;
     }
 
+    bool DetachSingle(PHYSICAL_MONITOR& out)
+    {
+        if (monitors_.size() != 1) {
+            return false;
+        }
+        out = monitors_[0];
+        monitors_.clear();
+        return true;
+    }
+
 private:
     std::vector<PHYSICAL_MONITOR> monitors_;
 };
@@ -452,58 +642,37 @@ static bool WriteBrightness(DWORD value)
     return set.SetBrightness(value);
 }
 
-static void CacheBrightnessIfAvailable()
+static bool CacheBrightnessIfAvailable()
 {
     DWORD current = 0;
     DWORD maximum = 0;
     if (!ReadCurrentBrightness(current, maximum)) {
-        return;
+        return false;
     }
 
     if (current > 0 && current <= 100) {
         const DWORD previous = LoadSavedBrightness();
         if (current != previous) {
             SaveBrightness(current);
-            Log(L"Cached nonzero brightness changed: %lu -> %lu", previous, current);
+            Log(L"User/external nonzero brightness adopted: %lu -> %lu", previous, current);
+            return true;
         }
     }
+    return false;
 }
 
-static DWORD GetTemporaryDimBrightness()
+static DWORD GetTemporaryDimBrightness(DWORD dimPercent)
 {
     const DWORD saved = LoadSavedBrightness();
+    dimPercent = ClampDword(dimPercent, 1, 100);
 
-    // 50% of the user's normal brightness, rounded up so a very low
+    // Percentage of the user's normal brightness, rounded up so a very low
     // nonzero setting never becomes an accidental OFF command.
-    DWORD dimmed = (saved + 1u) / 2u;
+    DWORD dimmed = (saved * dimPercent + 99u) / 100u;
     if (dimmed == 0) {
         dimmed = 1;
     }
     return dimmed;
-}
-
-static bool HandleDisplayDim()
-{
-    const DWORD saved = LoadSavedBrightness();
-    const DWORD dimmed = GetTemporaryDimBrightness();
-
-    Log(L"DISPLAY DIM -> temporary 50%% level: saved=%lu%% dim=%lu%%",
-        saved, dimmed);
-
-    // Do not call SaveBrightness() here. This is a temporary laptop-style
-    // dim stage; the original nonzero user brightness must remain the wake
-    // restore level.
-    for (int attempt = 1; attempt <= 3; ++attempt) {
-        if (WriteBrightness(dimmed)) {
-            Log(L"DISPLAY DIM -> VCP 0x10 = %lu succeeded (attempt %d)",
-                dimmed, attempt);
-            return true;
-        }
-        Sleep(20);
-    }
-
-    Log(L"DISPLAY DIM -> VCP 0x10 = %lu failed after retries", dimmed);
-    return false;
 }
 
 static bool HandleDisplayOff()
@@ -531,26 +700,29 @@ static bool HandleDisplayOff()
     return false;
 }
 
-static void HandleDisplayOn()
+static bool HandleDisplayOn()
 {
     DWORD restore = LoadSavedBrightness();
     Log(L"DISPLAY ON event -> restoring %lu%%", restore);
 
-    // HDMI/DDC may not be ready at the instant Windows reports ON.
+    // Blocking retry helper used only by the manual recovery CLI and the
+    // obsolete service path.  The interactive v10.8 agent uses its own
+    // non-blocking timer-driven restore state machine.
     for (int attempt = 1; attempt <= 20; ++attempt) {
         if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) {
-            return;
+            return false;
         }
 
         if (WriteBrightness(restore)) {
             Log(L"DISPLAY ON -> restored %lu%% (attempt %d)", restore, attempt);
-            return;
+            return true;
         }
 
         Sleep(500);
     }
 
     Log(L"DISPLAY ON -> restore failed after 10 seconds");
+    return false;
 }
 
 static DWORD WINAPI WorkerThreadProc(LPVOID)
@@ -640,7 +812,7 @@ static DWORD WINAPI ServiceControlHandler(
 }
 
 /* -------------------------------------------------------------------------
- * Interactive user-session power agent
+ * Interactive user-session power agent -- v10.8 predictive DIM-to-OFF
  * ------------------------------------------------------------------------- */
 
 static HPOWERNOTIFY g_agentSessionNotify = nullptr;
@@ -649,544 +821,500 @@ static HPOWERNOTIFY g_agentConsoleNotify = nullptr;
 static HPOWERNOTIFY g_agentLegacyNotify = nullptr;
 static HPOWERNOTIFY g_agentLidNotify = nullptr;
 static HPOWERNOTIFY g_agentSuspendResumeNotify = nullptr;
+
 static bool g_agentDisplayOn = true;
 static bool g_agentDimmed = false;
-static bool g_agentPreblanked = false;
-static HANDLE g_agentDisplayPowerRequest = INVALID_HANDLE_VALUE;
-static bool g_agentDisplayPowerRequestActive = false;
-static DWORD g_agentDisplayHoldInputTick = 0;
-static ULONGLONG g_agentDisplayHoldReleaseTick = 0;
-static bool g_agentPreblankSuppressedUntilInput = false;
-static DWORD g_agentSuppressionInputTick = 0;
-static DWORD g_agentPreblankInputTick = 0;
-static ULONGLONG g_agentExpectedWindowsOffTick = 0;
-
-// After an automatic VIDEOIDLE off, keep the panel latched dark until there is
-// actual user input. Display power notifications alone are not sufficient: the
-// PowerRequest hold/release sequence and legacy monitor notifications can
-// generate an ON transition even though nobody touched the machine.
-static bool g_agentAwaitingUserWake = false;
-static DWORD g_agentAutoOffInputTick = 0;
-static ULONGLONG g_agentLastBrightnessCacheTick = 0;
-static ULONGLONG g_agentLastPowerPlanRefreshTick = 0;
-static DWORD g_agentDisplayIdleTimeoutSec = 0;
-static bool g_agentDisplayIdleOnAc = true;
-
-// True only after an unattended/automatic resume. While set, display-ON
-// notifications alone are not allowed to light the panel. A real user-presence
-// transition or a later PBT_APMRESUMESUSPEND clears it.
-static bool g_agentResumeWaitingForUserPresence = false;
-
-// Set when this agent actually receives PBT_APMSUSPEND.  While set, an
-// authoritative GUID_SESSION_DISPLAY_STATUS=ON means Windows has chosen to
-// light the user's session again (for example a physical power-button wake).
-// That is a better wake signal than GetLastInputInfo(), which power-button
-// resumes do not necessarily update.
+static DWORD g_agentAppliedDimBrightness = 0;
 static bool g_agentWasSuspended = false;
-
-// v9.9: Windows applications can keep the display awake without generating
-// keyboard/mouse input.  Multimedia applications normally do this with
-// ES_DISPLAY_REQUIRED / PowerRequestDisplayRequired.  GetLastInputInfo() alone
-// therefore cannot be used as proof that Windows intends to blank the display.
-//
-// We sample SystemExecutionState only while our own display hold is NOT active,
-// so ES_DISPLAY_REQUIRED means another application/system component is asking
-// Windows to keep the display on rather than our own fade guard.
-static bool g_agentExternalDisplayRequired = false;
-static ULONGLONG g_agentPostRequestOffTick = 0;
-static bool g_agentExecutionStateErrorLogged = false;
-static bool g_agentStartupRecoveryPending = true;
-static bool g_agentPredictionUnavailableLogged = false;
+static bool g_agentResumeWaitingForUserPresence = false;
 static bool g_agentLidClosed = false;
+static bool g_agentSessionStateKnown = false;
+static bool g_agentStartupFallbackDone = false;
+// Set as soon as WM_QUERYENDSESSION arrives. While true, shutdown/restart/sign-out
+// owns the UI and ALL later display-state telemetry is ignored so it cannot
+// accidentally translate into VCP 0x10=0. Cleared if Windows cancels shutdown.
+static bool g_agentSessionEnding = false;
 
-static bool EnsureAgentDisplayPowerRequest()
+static bool AgentWindowsSessionIsEnding()
 {
-    if (g_agentDisplayPowerRequest != INVALID_HANDLE_VALUE) {
-        return true;
+#ifdef SM_SHUTTINGDOWN
+    return g_agentSessionEnding || GetSystemMetrics(SM_SHUTTINGDOWN) != 0;
+#else
+    return g_agentSessionEnding;
+#endif
+}
+
+static ULONGLONG g_agentStartupFallbackTick = 0;
+static ULONGLONG g_agentLastBrightnessCacheTick = 0;
+static ULONGLONG g_agentLastSettingsPollTick = 0;
+
+static PredictionSettings g_agentSettings{};
+static bool g_agentPredictionPending = false;
+static bool g_agentPredictionPreOffSent = false;
+static bool g_agentDimCycleEligibleForLearning = false;
+static ULONGLONG g_agentDimStartTick = 0;
+static ULONGLONG g_agentPredictionDueTick = 0;
+static ULONGLONG g_agentPredictionPreOffTick = 0;
+
+// Restore retries are deliberately non-blocking.  A slow HDMI/DDC wake must not
+// block WM_POWERBROADCAST for up to ten seconds as older builds did.
+static bool g_agentRestorePending = false;
+static int g_agentRestoreAttempts = 0;
+static ULONGLONG g_agentNextRestoreTick = 0;
+
+// Keep one already-resolved Dxva2 physical-monitor handle while the display is
+// ON. This removes DisplayConfig/HMONITOR enumeration from the critical OFF
+// path. The handle is invalidated and reopened automatically if topology changes.
+static HANDLE g_agentCachedPhysicalMonitor = nullptr;
+static std::wstring g_agentCachedPhysicalMonitorDescription;
+
+static void CloseAgentCachedPhysicalMonitor()
+{
+    if (g_agentCachedPhysicalMonitor) {
+        DestroyPhysicalMonitor(g_agentCachedPhysicalMonitor);
+        g_agentCachedPhysicalMonitor = nullptr;
+        g_agentCachedPhysicalMonitorDescription.clear();
     }
+}
 
-    REASON_CONTEXT reason{};
-    reason.Version = POWER_REQUEST_CONTEXT_VERSION;
-    reason.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
-    reason.Reason.SimpleReasonString =
-        const_cast<LPWSTR>(L"ESP32 panel fade before Windows display power-off");
-
-    g_agentDisplayPowerRequest = PowerCreateRequest(&reason);
-    if (g_agentDisplayPowerRequest == INVALID_HANDLE_VALUE) {
-        Log(L"PowerCreateRequest failed: %lu", GetLastError());
+static bool RefreshAgentCachedPhysicalMonitor()
+{
+    DisplayTarget target;
+    PhysicalMonitorSet set;
+    if (!OpenTargetPhysicalMonitors(target, set)) {
         return false;
     }
 
-    Log(L"Created display power-request handle=%p", g_agentDisplayPowerRequest);
+    PHYSICAL_MONITOR pm{};
+    if (!set.DetachSingle(pm) || !pm.hPhysicalMonitor) {
+        return false;
+    }
+
+    CloseAgentCachedPhysicalMonitor();
+    g_agentCachedPhysicalMonitor = pm.hPhysicalMonitor;
+    g_agentCachedPhysicalMonitorDescription = pm.szPhysicalMonitorDescription;
+    Log(L"Cached fast DDC handle for '%s'", g_agentCachedPhysicalMonitorDescription.c_str());
     return true;
 }
 
-static bool AcquireAgentDisplayHold(DWORD lastInputTick)
+static bool AgentWriteBrightnessFast(DWORD value)
 {
-    if (g_agentDisplayPowerRequestActive) {
+    if (g_agentCachedPhysicalMonitor) {
+        SetLastError(ERROR_SUCCESS);
+        if (SetVCPFeature(g_agentCachedPhysicalMonitor, kVcpBrightness, value)) {
+            Log(L"FAST DDC brightness write to cached '%s': %lu",
+                g_agentCachedPhysicalMonitorDescription.c_str(), value);
+            return true;
+        }
+
+        Log(L"Cached DDC handle write=%lu failed (error=%lu); reopening target",
+            value, GetLastError());
+        CloseAgentCachedPhysicalMonitor();
+    }
+
+    if (!RefreshAgentCachedPhysicalMonitor()) {
+        return false;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    if (SetVCPFeature(g_agentCachedPhysicalMonitor, kVcpBrightness, value)) {
+        Log(L"FAST DDC brightness write after reopen to '%s': %lu",
+            g_agentCachedPhysicalMonitorDescription.c_str(), value);
         return true;
     }
 
-    if (!EnsureAgentDisplayPowerRequest()) {
-        return false;
-    }
-
-    if (!PowerSetRequest(g_agentDisplayPowerRequest, PowerRequestDisplayRequired)) {
-        Log(L"PowerSetRequest(PowerRequestDisplayRequired) failed: %lu", GetLastError());
-        return false;
-    }
-
-    g_agentDisplayPowerRequestActive = true;
-    g_agentDisplayHoldInputTick = lastInputTick;
-    g_agentDisplayHoldReleaseTick = 0;
-    Log(L"DISPLAY HOLD acquired -> Windows must keep the session display pipeline on");
-    return true;
+    Log(L"Reopened cached DDC handle write=%lu failed: %lu", value, GetLastError());
+    CloseAgentCachedPhysicalMonitor();
+    return false;
 }
 
-static void ReleaseAgentDisplayHold(const wchar_t* reason)
+
+static void LogPredictionSettings(const PredictionSettings& cfg, const wchar_t* prefix)
 {
-    if (!g_agentDisplayPowerRequestActive) {
-        g_agentDisplayHoldReleaseTick = 0;
+    Log(L"%s: Enabled=%u Learning=%u RequireLearned=%u CheckDisplayRequired=%u DimPercent=%lu AdvanceMs=%lu ConfirmTimeoutMs=%lu FallbackDimToOffMs=%lu MinDelayMs=%lu LearnRange=%lu..%lu",
+        prefix ? prefix : L"Settings",
+        cfg.enabled ? 1u : 0u,
+        cfg.learningEnabled ? 1u : 0u,
+        cfg.requireLearnedSample ? 1u : 0u,
+        cfg.checkDisplayRequired ? 1u : 0u,
+        cfg.dimPercent,
+        cfg.advanceMs,
+        cfg.preOffConfirmTimeoutMs,
+        cfg.fallbackDimToOffMs,
+        cfg.minimumPredictionDelayMs,
+        cfg.minimumLearnIntervalMs,
+        cfg.maximumLearnIntervalMs);
+}
+
+static bool GetValidLearnedPredictionInterval(DWORD& interval)
+{
+    const DWORD learned = LoadBridgeDword(L"LearnedDimToOffMs", 0);
+    const DWORD samples = LoadBridgeDword(L"LearnedDimToOffSamples", 0);
+    if (samples > 0 &&
+        learned >= g_agentSettings.minimumLearnIntervalMs &&
+        learned <= g_agentSettings.maximumLearnIntervalMs) {
+        interval = learned;
+        return true;
+    }
+    return false;
+}
+
+static DWORD GetPredictionIntervalMs()
+{
+    DWORD learned = 0;
+    if (g_agentSettings.learningEnabled && GetValidLearnedPredictionInterval(learned)) {
+        return learned;
+    }
+    return g_agentSettings.fallbackDimToOffMs;
+}
+
+static void RecomputePredictionDueTick(bool logChange)
+{
+    if (!g_agentPredictionPending || g_agentDimStartTick == 0) {
         return;
     }
 
-    if (!PowerClearRequest(g_agentDisplayPowerRequest, PowerRequestDisplayRequired)) {
-        const DWORD err = GetLastError();
-        Log(L"PowerClearRequest(PowerRequestDisplayRequired) failed: %lu; closing request handle", err);
-
-        // Closing a power-request object releases any request counts that belong
-        // to it. Recreate the object next time rather than risk leaving Windows
-        // artificially held on.
-        CloseHandle(g_agentDisplayPowerRequest);
-        g_agentDisplayPowerRequest = INVALID_HANDLE_VALUE;
-    } else {
-        Log(L"DISPLAY HOLD released: %s", reason ? reason : L"no reason");
+    if (!g_agentSettings.enabled) {
+        g_agentPredictionPending = false;
+        g_agentPredictionDueTick = 0;
+        if (logChange) {
+            Log(L"DIM->OFF prediction disabled by settings; waiting for authoritative Windows OFF");
+        }
+        return;
     }
 
-    g_agentDisplayPowerRequestActive = false;
-    g_agentDisplayHoldReleaseTick = 0;
+    if (g_agentSettings.learningEnabled && g_agentSettings.requireLearnedSample) {
+        DWORD learned = 0;
+        if (!GetValidLearnedPredictionInterval(learned)) {
+            g_agentPredictionPending = false;
+            g_agentPredictionDueTick = 0;
+            if (logChange) {
+                Log(L"DIM->OFF calibration cycle: no valid learned sample yet; waiting for real Windows OFF");
+            }
+            return;
+        }
+    }
+
+    const DWORD interval = GetPredictionIntervalMs();
+    const DWORD rawDelay = interval > g_agentSettings.advanceMs
+        ? interval - g_agentSettings.advanceMs
+        : 0u;
+    const DWORD delay = (std::max)(g_agentSettings.minimumPredictionDelayMs, rawDelay);
+    g_agentPredictionDueTick = g_agentDimStartTick + delay;
+
+    if (logChange) {
+        Log(L"DIM->OFF prediction scheduled: interval=%lums advance=%lums -> pre-OFF at +%lums",
+            interval, g_agentSettings.advanceMs, delay);
+    }
 }
 
-static void CloseAgentDisplayPowerRequest()
+static void ReloadPredictionSettings(bool forceLog)
 {
-    ReleaseAgentDisplayHold(L"agent shutdown");
-    if (g_agentDisplayPowerRequest != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_agentDisplayPowerRequest);
-        g_agentDisplayPowerRequest = INVALID_HANDLE_VALUE;
+    const PredictionSettings next = ReadPredictionSettingsFromIni();
+    const bool changed = !PredictionSettingsEqual(next, g_agentSettings);
+    if (changed || forceLog) {
+        g_agentSettings = next;
+        LogPredictionSettings(g_agentSettings, changed ? L"settings.ini reloaded" : L"settings.ini");
+        if (g_agentPredictionPending) {
+            RecomputePredictionDueTick(true);
+        }
     }
 }
 
-static bool QueryDisplayIdleTimeout(DWORD& timeoutSeconds, bool& onAcPower)
+static void CancelAgentPrediction(const wchar_t* reason, bool invalidateLearning)
 {
-    SYSTEM_POWER_STATUS status{};
-    if (!GetSystemPowerStatus(&status)) {
-        Log(L"GetSystemPowerStatus failed: %lu", GetLastError());
-        return false;
+    if (g_agentPredictionPending || g_agentPredictionPreOffSent) {
+        Log(L"DIM->OFF prediction cancelled: %s", reason ? reason : L"no reason");
     }
-
-    onAcPower = (status.ACLineStatus != 0);
-
-    GUID* activeScheme = nullptr;
-    DWORD rc = PowerGetActiveScheme(nullptr, &activeScheme);
-    if (rc != ERROR_SUCCESS || !activeScheme) {
-        Log(L"PowerGetActiveScheme failed: %lu", rc);
-        return false;
+    g_agentPredictionPending = false;
+    g_agentPredictionDueTick = 0;
+    g_agentPredictionPreOffSent = false;
+    g_agentPredictionPreOffTick = 0;
+    if (invalidateLearning) {
+        g_agentDimCycleEligibleForLearning = false;
+        g_agentDimStartTick = 0;
     }
-
-    DWORD value = 0;
-    if (onAcPower) {
-        rc = PowerReadACValueIndex(nullptr, activeScheme, &kGuidVideoSubgroup, &kGuidVideoIdle, &value);
-    } else {
-        rc = PowerReadDCValueIndex(nullptr, activeScheme, &kGuidVideoSubgroup, &kGuidVideoIdle, &value);
-    }
-
-    LocalFree(activeScheme);
-
-    if (rc != ERROR_SUCCESS) {
-        Log(L"PowerRead%sValueIndex(VIDEOIDLE) failed: %lu",
-            onAcPower ? L"AC" : L"DC", rc);
-        return false;
-    }
-
-    timeoutSeconds = value;
-    return true;
 }
 
-static bool QuerySystemExecutionState(EXECUTION_STATE& state)
+static void LearnDimToOffInterval(ULONGLONG observedMs)
 {
-    ULONG rawState = 0;
-    // CallNtPowerInformation returns NTSTATUS, whose Win32 ABI is a signed
-    // 32-bit LONG.  Some Windows SDK configurations do not expose the
-    // NTSTATUS typedef to ordinary desktop C++ translation units, so keep
-    // the value in LONG instead of depending on ntstatus.h.
-    const LONG status = CallNtPowerInformation(
+    if (!g_agentSettings.learningEnabled || !g_agentDimCycleEligibleForLearning) {
+        return;
+    }
+
+    if (observedMs < g_agentSettings.minimumLearnIntervalMs ||
+        observedMs > g_agentSettings.maximumLearnIntervalMs) {
+        Log(L"DIM->OFF learning sample %llums ignored (allowed %lu..%lums)",
+            observedMs,
+            g_agentSettings.minimumLearnIntervalMs,
+            g_agentSettings.maximumLearnIntervalMs);
+        return;
+    }
+
+    DWORD oldAverage = LoadBridgeDword(L"LearnedDimToOffMs", 0);
+    DWORD samples = LoadBridgeDword(L"LearnedDimToOffSamples", 0);
+    DWORD newAverage = static_cast<DWORD>(observedMs);
+
+    if (samples > 0 &&
+        oldAverage >= g_agentSettings.minimumLearnIntervalMs &&
+        oldAverage <= g_agentSettings.maximumLearnIntervalMs) {
+        // Cap historical weight so the predictor can adapt if Windows changes
+        // its DIM->OFF cadence after a power-policy or OS update.
+        const DWORD weight = (std::min<DWORD>)(samples, 7u);
+        newAverage = static_cast<DWORD>(
+            (static_cast<ULONGLONG>(oldAverage) * weight + observedMs) / (weight + 1u));
+    }
+
+    const DWORD newSamples = (std::min<DWORD>)(samples + 1u, 1000000u);
+    SaveBridgeDword(L"LearnedDimToOffMs", newAverage);
+    SaveBridgeDword(L"LearnedDimToOffSamples", newSamples);
+    Log(L"DIM->OFF learned: observed=%llums average=%lums samples=%lu",
+        observedMs, newAverage, newSamples);
+}
+
+static bool QueryExternalDisplayRequired(bool& required)
+{
+    required = false;
+    ULONG executionState = 0;
+    const LONG status = static_cast<LONG>(CallNtPowerInformation(
         SystemExecutionState,
         nullptr,
         0,
-        &rawState,
-        sizeof(rawState));
+        &executionState,
+        sizeof(executionState)));
 
     if (status != 0) {
-        if (!g_agentExecutionStateErrorLogged) {
-            Log(L"CallNtPowerInformation(SystemExecutionState) failed: 0x%08lX",
-                static_cast<unsigned long>(status));
-            g_agentExecutionStateErrorLogged = true;
-        }
+        Log(L"CallNtPowerInformation(SystemExecutionState) failed: 0x%08lX",
+            static_cast<unsigned long>(status));
         return false;
     }
 
-    g_agentExecutionStateErrorLogged = false;
-    state = static_cast<EXECUTION_STATE>(rawState);
+    required = (executionState & ES_DISPLAY_REQUIRED) != 0;
     return true;
 }
 
-static bool GetSessionIdleState(DWORD& idleMs, DWORD& lastInputTick)
+static void BeginAgentDimCyclePrediction()
 {
-    LASTINPUTINFO lii{};
-    lii.cbSize = sizeof(lii);
+    g_agentDimStartTick = GetTickCount64();
+    g_agentDimCycleEligibleForLearning = true;
+    g_agentPredictionPreOffSent = false;
+    g_agentPredictionPreOffTick = 0;
+    g_agentPredictionPending = g_agentSettings.enabled;
+    g_agentPredictionDueTick = 0;
 
-    if (!GetLastInputInfo(&lii)) {
-        Log(L"GetLastInputInfo failed: %lu", GetLastError());
-        return false;
+    if (g_agentPredictionPending) {
+        RecomputePredictionDueTick(true);
+    } else {
+        Log(L"Windows DIM accepted; prediction disabled, waiting for authoritative Windows OFF");
     }
-
-    const DWORD now32 = GetTickCount();
-    lastInputTick = lii.dwTime;
-    idleMs = now32 - lii.dwTime;
-    return true;
 }
 
-static void RefreshDisplayIdlePolicy(bool forceLog)
+static void AgentPredictionTimerTick(ULONGLONG now)
 {
-    DWORD seconds = 0;
-    bool onAc = true;
-    if (!QueryDisplayIdleTimeout(seconds, onAc)) {
+    if (!g_agentPredictionPending || g_agentPredictionDueTick == 0 ||
+        now < g_agentPredictionDueTick) {
         return;
     }
 
-    if (forceLog ||
-        seconds != g_agentDisplayIdleTimeoutSec ||
-        onAc != g_agentDisplayIdleOnAc) {
-        Log(L"Windows VIDEOIDLE policy: %lu seconds (%s)",
-            seconds, onAc ? L"AC" : L"battery");
+    // Consume this prediction once. Failure always falls back to Windows' real
+    // OFF notification rather than repeatedly hammering DDC.
+    g_agentPredictionPending = false;
+    g_agentPredictionDueTick = 0;
+
+    if (AgentWindowsSessionIsEnding() || !g_agentDisplayOn || !g_agentDimmed ||
+        g_agentResumeWaitingForUserPresence || g_agentLidClosed) {
+        CancelAgentPrediction(L"state no longer eligible", true);
+        return;
     }
 
-    g_agentDisplayIdleTimeoutSec = seconds;
-    g_agentDisplayIdleOnAc = onAc;
+    // If another DDC client or the ESP32 keyboard changed brightness after our
+    // temporary DIM, that is user intent. Never pre-blank over it.
+    DWORD current = 0;
+    DWORD maximum = 0;
+    if (ReadCurrentBrightness(current, maximum) && current > 0 && current <= 100 &&
+        g_agentAppliedDimBrightness != 0 && current != g_agentAppliedDimBrightness) {
+        SaveBrightness(current);
+        Log(L"Prediction cancelled: external/user brightness changed during DIM (%lu -> %lu)",
+            g_agentAppliedDimBrightness, current);
+        g_agentDimmed = false;
+        g_agentAppliedDimBrightness = 0;
+        SaveTemporaryDimState(false, 0);
+        CancelAgentPrediction(L"external brightness change", true);
+        return;
+    }
+
+    if (g_agentSettings.checkDisplayRequired) {
+        bool displayRequired = false;
+        if (!QueryExternalDisplayRequired(displayRequired)) {
+            CancelAgentPrediction(L"could not verify ES_DISPLAY_REQUIRED; fail open", false);
+            return;
+        }
+        if (displayRequired) {
+            CancelAgentPrediction(L"ES_DISPLAY_REQUIRED is active; waiting for Windows", true);
+            return;
+        }
+    }
+
+    if (AgentWriteBrightnessFast(0)) {
+        g_agentPredictionPreOffSent = true;
+        g_agentPredictionPreOffTick = now;
+        Log(L"PREDICTED PRE-OFF -> VCP 0x10 = 0; waiting up to %lums for authoritative Windows OFF",
+            g_agentSettings.preOffConfirmTimeoutMs);
+    } else {
+        Log(L"PREDICTED PRE-OFF write failed; waiting for authoritative Windows OFF (fail open)");
+    }
 }
 
-static void RestoreAfterCancelledPreblank(const wchar_t* reason, DWORD currentInputTick)
+
+static void AgentPredictionConfirmationTick(ULONGLONG now)
 {
-    Log(L"EARLY BLANK cancelled: %s -> restoring saved brightness", reason);
+    if (!g_agentPredictionPreOffSent || g_agentPredictionPreOffTick == 0 ||
+        now - g_agentPredictionPreOffTick < g_agentSettings.preOffConfirmTimeoutMs) {
+        return;
+    }
 
-    g_agentDimmed = false;
-    g_agentPreblanked = false;
-    g_agentAwaitingUserWake = false;
-    g_agentAutoOffInputTick = 0;
-    g_agentExpectedWindowsOffTick = 0;
-    g_agentPostRequestOffTick = 0;
-    g_agentPreblankSuppressedUntilInput = true;
-    g_agentSuppressionInputTick = currentInputTick;
+    // Windows did not confirm OFF soon enough. Treat the prediction as wrong
+    // and recover to the temporary DIM level instead of leaving the only panel
+    // black. The real Windows OFF notification remains authoritative later.
+    const DWORD dimValue = g_agentAppliedDimBrightness > 0
+        ? g_agentAppliedDimBrightness
+        : GetTemporaryDimBrightness(g_agentSettings.dimPercent);
 
-    ReleaseAgentDisplayHold(L"early sequence cancelled");
-    HandleDisplayOn();
+    Log(L"PREDICTED PRE-OFF was not confirmed within %lums -> recovering visible DIM level %lu%%",
+        g_agentSettings.preOffConfirmTimeoutMs, dimValue);
+
+    bool recovered = AgentWriteBrightnessFast(dimValue);
+    if (!recovered) {
+        const DWORD normal = LoadSavedBrightness();
+        Log(L"DIM-level recovery failed -> trying normal saved brightness %lu%%", normal);
+        recovered = AgentWriteBrightnessFast(normal);
+        if (recovered) {
+            g_agentDimmed = false;
+            g_agentAppliedDimBrightness = 0;
+            SaveTemporaryDimState(false, 0);
+        }
+    }
+
+    if (!recovered) {
+        Log(L"WARNING: predicted pre-OFF recovery DDC write failed; next Windows ON/emergency hotkey will retry");
+    }
+
+    CancelAgentPrediction(L"predicted OFF not confirmed", true);
+}
+
+static void CancelAgentRestore(const wchar_t* reason)
+{
+    if (g_agentRestorePending) {
+        Log(L"Pending brightness restore cancelled: %s", reason ? reason : L"no reason");
+    }
+    g_agentRestorePending = false;
+    g_agentRestoreAttempts = 0;
+    g_agentNextRestoreTick = 0;
+}
+
+static bool AgentTryRestoreOnce()
+{
+    if (!g_agentRestorePending) {
+        return true;
+    }
+
+    const DWORD restore = LoadSavedBrightness();
+    ++g_agentRestoreAttempts;
+
+    // If DDC is already readable and someone (ESP keyboard or another DDC app)
+    // has selected a nonzero level that is not our own temporary DIM value, that
+    // external choice wins. Do not overwrite it with a stale cached restore.
+    DWORD current = 0;
+    DWORD maximum = 0;
+    if (ReadCurrentBrightness(current, maximum) && current > 0 && current <= 100 &&
+        (g_agentAppliedDimBrightness == 0 || current != g_agentAppliedDimBrightness)) {
+        if (current != restore) {
+            SaveBrightness(current);
+            Log(L"Wake restore cancelled: external/user brightness %lu%% is authoritative (cached=%lu%%)",
+                current, restore);
+        } else {
+            Log(L"Wake restore already satisfied at %lu%%", current);
+        }
+        g_agentRestorePending = false;
+        g_agentRestoreAttempts = 0;
+        g_agentNextRestoreTick = 0;
+        g_agentDimmed = false;
+        g_agentAppliedDimBrightness = 0;
+        SaveTemporaryDimState(false, 0);
+        return true;
+    }
+
+    if (AgentWriteBrightnessFast(restore)) {
+        Log(L"DISPLAY ON -> restored %lu%% (non-blocking attempt %d)",
+            restore, g_agentRestoreAttempts);
+        g_agentRestorePending = false;
+        g_agentRestoreAttempts = 0;
+        g_agentNextRestoreTick = 0;
+        g_agentDimmed = false;
+        g_agentAppliedDimBrightness = 0;
+        SaveTemporaryDimState(false, 0);
+        return true;
+    }
+
+    if (g_agentRestoreAttempts >= kRestoreRetryMaxAttempts) {
+        Log(L"DISPLAY ON -> restore %lu%% failed after %d non-blocking attempts; giving up until next ON/user recovery",
+            restore, kRestoreRetryMaxAttempts);
+        g_agentRestorePending = false;
+        g_agentNextRestoreTick = 0;
+        return false;
+    }
+
+    g_agentNextRestoreTick = GetTickCount64() + kRestoreRetryIntervalMs;
+    return false;
+}
+
+static void ScheduleAgentRestore(const wchar_t* reason)
+{
+    Log(L"DISPLAY ON -> schedule restore of saved brightness (%s)",
+        reason ? reason : L"no reason");
+
+    g_agentRestorePending = true;
+    g_agentRestoreAttempts = 0;
+    g_agentNextRestoreTick = GetTickCount64();
+
+    // One immediate attempt gives power-button/keyboard wakes a fast response;
+    // further attempts are timer-driven and never block the message pump.
+    AgentTryRestoreOnce();
 }
 
 static void AgentTimerTick()
 {
     const ULONGLONG now = GetTickCount64();
 
-    if (g_agentLastPowerPlanRefreshTick == 0 ||
-        now - g_agentLastPowerPlanRefreshTick >= kPowerPlanRefreshIntervalMs) {
-        RefreshDisplayIdlePolicy(g_agentLastPowerPlanRefreshTick == 0);
-        g_agentLastPowerPlanRefreshTick = now;
+    if (g_agentLastSettingsPollTick == 0 ||
+        now - g_agentLastSettingsPollTick >= kSettingsPollIntervalMs) {
+        ReloadPredictionSettings(false);
+        g_agentLastSettingsPollTick = now;
     }
 
-    DWORD idleMs = 0;
-    DWORD lastInputTick = 0;
-    if (!GetSessionIdleState(idleMs, lastInputTick)) {
-        return;
-    }
+    AgentPredictionTimerTick(now);
+    AgentPredictionConfirmationTick(now);
 
-    const ULONGLONG timeoutMs =
-        static_cast<ULONGLONG>(g_agentDisplayIdleTimeoutSec) * 1000ULL;
-
-    // Fail-safe after an agent crash/update: if the process has just started and
-    // this session has recent real input, make sure the panel is visible.  A
-    // stale VCP 0x10=0 must never strand the user at a black desktop.
-    if (g_agentStartupRecoveryPending) {
-        g_agentStartupRecoveryPending = false;
-        if (static_cast<ULONGLONG>(idleMs) <= kStartupRecoveryRecentInputMs) {
-            Log(L"Startup recovery: recent user input detected (%lu ms idle) -> forcing saved brightness ON", idleMs);
-            g_agentDisplayOn = true;
-            g_agentDimmed = false;
-            g_agentPreblanked = false;
-            g_agentAwaitingUserWake = false;
-            HandleDisplayOn();
-        } else {
-            Log(L"Startup recovery skipped: session idle=%lu ms", idleMs);
-        }
-    }
-
-    // Respect Windows display-availability requests.  A video player can keep
-    // the display on with ES_DISPLAY_REQUIRED while GetLastInputInfo() continues
-    // to age.  v9.8 ignored that distinction and repeatedly entered the
-    // DIM/OFF sequence during video playback.
-    //
-    // Do not query while our own PowerRequestDisplayRequired hold is active:
-    // the aggregate SystemExecutionState would then include our own request and
-    // could not be distinguished from another application's request.
-    bool executionStateKnown = false;
-    bool externalDisplayRequiredNow = false;
-    if (!g_agentDisplayPowerRequestActive) {
-        EXECUTION_STATE executionState = 0;
-        if (QuerySystemExecutionState(executionState)) {
-            executionStateKnown = true;
-            externalDisplayRequiredNow =
-                (executionState & ES_DISPLAY_REQUIRED) != 0;
-        }
-    }
-
-    if (!g_agentDisplayPowerRequestActive && !executionStateKnown) {
-        if (!g_agentPredictionUnavailableLogged) {
-            Log(L"Predictive VIDEOIDLE disabled for this tick: Windows execution state is unknown; failing open");
-            g_agentPredictionUnavailableLogged = true;
-        }
-    } else if (executionStateKnown) {
-        g_agentPredictionUnavailableLogged = false;
-    }
-
-    if (executionStateKnown && externalDisplayRequiredNow) {
-        if (!g_agentExternalDisplayRequired) {
-            Log(L"External ES_DISPLAY_REQUIRED detected -> suspending predictive VIDEOIDLE dim/off");
-        }
-        g_agentExternalDisplayRequired = true;
-        g_agentPostRequestOffTick = 0;
-
-        // If we have not yet intentionally turned the panel off, an external
-        // display request wins.  This is normally reached before Stage 0 because
-        // our own hold has not been acquired yet.
-        if ((g_agentDimmed || g_agentPreblanked) && !g_agentAwaitingUserWake) {
-            Log(L"External display request arrived during predictive sequence -> restoring normal brightness");
-            g_agentDimmed = false;
-            g_agentPreblanked = false;
-            g_agentExpectedWindowsOffTick = 0;
-            ReleaseAgentDisplayHold(L"external display-required request");
-            HandleDisplayOn();
-        }
-    } else if (executionStateKnown && g_agentExternalDisplayRequired &&
-               !externalDisplayRequiredNow) {
-        Log(L"External ES_DISPLAY_REQUIRED cleared");
-        g_agentExternalDisplayRequired = false;
-
-        // If the application held the display awake past the configured Windows
-        // timeout, Windows may become eligible to blank immediately when the
-        // request disappears.  Take our short fade guard immediately, dim now,
-        // then send OFF after the usual 2.5 s stage.
-        if (g_agentDisplayOn && !g_agentAwaitingUserWake && timeoutMs != 0 &&
-            static_cast<ULONGLONG>(idleMs) >= timeoutMs) {
-            if (AcquireAgentDisplayHold(lastInputTick)) {
-                if (HandleDisplayDim()) {
-                    g_agentDimmed = true;
-                    g_agentPreblankInputTick = lastInputTick;
-                    g_agentPostRequestOffTick = now + kOffLeadMs;
-                    Log(L"Display request ended after VIDEOIDLE deadline -> DIM 50%% now; OFF in %lu ms",
-                        kOffLeadMs);
-                }
-            }
-        }
-    }
-
-    // A timeout-driven OFF is latched until *real* user input occurs. This is
-    // deliberately checked independently of Windows display-state notifications
-    // so a synthetic/stale ON notification cannot wake the backlight.
-    if (g_agentAwaitingUserWake && lastInputTick != g_agentAutoOffInputTick) {
-        Log(L"Real user input observed after automatic display-off -> restoring panel");
-        g_agentAwaitingUserWake = false;
-        g_agentAutoOffInputTick = 0;
+    // RegisterPowerSettingNotification normally supplies the current session
+    // display state.  If that notification is unavailable, fail toward a usable
+    // screen after a short grace period rather than leaving a user permanently
+    // black after an agent crash/restart.
+    if (!g_agentStartupFallbackDone && !g_agentSessionStateKnown &&
+        g_agentStartupFallbackTick != 0 && now >= g_agentStartupFallbackTick) {
+        g_agentStartupFallbackDone = true;
+        Log(L"Startup safety fallback: no SESSION_DISPLAY_STATUS received -> one fail-open brightness restore attempt");
         g_agentDisplayOn = true;
-        g_agentDimmed = false;
-        g_agentPreblanked = false;
-        g_agentPreblankSuppressedUntilInput = false;
-        g_agentExpectedWindowsOffTick = 0;
-        g_agentPostRequestOffTick = 0;
-        ReleaseAgentDisplayHold(L"real user wake");
-        HandleDisplayOn();
-        return;
+        ScheduleAgentRestore(L"startup state notification missing");
     }
 
-    // Once the ESP32 has had enough time to finish its local fade, release
-    // Windows' display hold. If Windows' own idle deadline has already passed,
-    // it can now remove the HDMI picture -- behind an already-black backlight.
-    if (g_agentDisplayPowerRequestActive &&
-        g_agentDisplayHoldReleaseTick != 0 &&
-        now >= g_agentDisplayHoldReleaseTick) {
-        ReleaseAgentDisplayHold(L"ESP32 fade guard complete");
+    if (g_agentRestorePending && now >= g_agentNextRestoreTick) {
+        AgentTryRestoreOnce();
     }
 
-    // If we only acquired the hold so far and the user becomes active again,
-    // drop it immediately. No brightness restoration is needed until DIM/OFF.
-    if (g_agentDisplayPowerRequestActive &&
-        !g_agentDimmed &&
-        !g_agentPreblanked &&
-        lastInputTick != g_agentDisplayHoldInputTick) {
-        ReleaseAgentDisplayHold(L"user input before dim stage");
-    }
-
-    if (g_agentPreblankSuppressedUntilInput &&
-        lastInputTick != g_agentSuppressionInputTick) {
-        Log(L"User input observed -> re-arming early VIDEOIDLE blanking");
-        g_agentPreblankSuppressedUntilInput = false;
-    }
-
-    if (g_agentDimmed || g_agentPreblanked) {
-        if (lastInputTick != g_agentPreblankInputTick) {
-            RestoreAfterCancelledPreblank(
-                L"user input during dim/off sequence",
-                lastInputTick);
-            return;
-        }
-
-        // Only abandon an uncompleted DIM stage. Once VCP 0x10=0 has
-        // succeeded, never wake the panel merely because Windows failed to
-        // produce an OFF notification on our predicted schedule. The display
-        // hold itself can shift/suppress that notification, and v9.5's old
-        // watchdog was the direct cause of spontaneous re-wake.
-        if (g_agentDimmed && !g_agentPreblanked && !g_agentAwaitingUserWake &&
-            g_agentExpectedWindowsOffTick != 0 &&
-            now > g_agentExpectedWindowsOffTick + kPreblankOffConfirmGraceMs) {
-            RestoreAfterCancelledPreblank(
-                L"DIM stage expired before OFF command completed",
-                lastInputTick);
-            return;
-        }
-    }
-
-    // Deferred OFF after an external display-required request ends beyond the
-    // normal idle deadline.  The display hold is already active, so HDMI stays
-    // alive while the ESP32 performs the same laptop-like fade sequence.
-    if (g_agentPostRequestOffTick != 0 && now >= g_agentPostRequestOffTick &&
-        !g_agentPreblanked) {
-        if (lastInputTick != g_agentPreblankInputTick) {
-            RestoreAfterCancelledPreblank(
-                L"user input after display-required request ended",
-                lastInputTick);
-            return;
-        }
-
-        Log(L"POST-REQUEST VIDEOIDLE OFF -> sending VCP 0x10=0");
-        if (HandleDisplayOff()) {
-            g_agentPreblanked = true;
-            g_agentAwaitingUserWake = true;
-            g_agentAutoOffInputTick = lastInputTick;
-            g_agentPostRequestOffTick = 0;
-            if (g_agentDisplayPowerRequestActive) {
-                g_agentDisplayHoldReleaseTick = now + kFadeGuardAfterOffMs;
-            }
-            Log(L"POST-REQUEST OFF succeeded; panel latched dark until real user wake");
-            return;
-        }
-
-        Log(L"POST-REQUEST OFF DDC write failed; retrying on next timer tick");
-    }
-
-    if (!g_agentDisplayOn) {
-        return;
-    }
-
-    if (!g_agentPreblankSuppressedUntilInput &&
-        !g_agentExternalDisplayRequired &&
-        timeoutMs != 0) {
-        const ULONGLONG idle64 = idleMs;
-
-        if (idle64 < timeoutMs) {
-            const ULONGLONG remainingMs = timeoutMs - idle64;
-
-            // Stage 0: acquire a short-lived DISPLAY_REQUIRED power request well
-            // before the visible sequence. This is the key difference from v9.4:
-            // even if Windows' internal display-idle clock is a few seconds ahead
-            // of GetLastInputInfo(), the GPU/display path is held on until our
-            // ESP32 fade has completed.
-            if (!g_agentDisplayPowerRequestActive &&
-                executionStateKnown &&
-                !externalDisplayRequiredNow &&
-                remainingMs <= kDisplayHoldLeadMs) {
-                Log(L"EARLY VIDEOIDLE HOLD: idle=%lu ms timeout=%llu ms remaining=%llu ms lead=%lu ms",
-                    idleMs,
-                    static_cast<unsigned long long>(timeoutMs),
-                    static_cast<unsigned long long>(remainingMs),
-                    kDisplayHoldLeadMs);
-                AcquireAgentDisplayHold(lastInputTick);
-            }
-
-            // Stage 1: start the integrated-panel-style temporary dim.
-            if (g_agentDisplayPowerRequestActive &&
-                !g_agentDimmed &&
-                !g_agentPreblanked &&
-                remainingMs <= kDimLeadMs) {
-
-                Log(L"EARLY VIDEOIDLE DIM: idle=%lu ms timeout=%llu ms remaining=%llu ms lead=%lu ms",
-                    idleMs,
-                    static_cast<unsigned long long>(timeoutMs),
-                    static_cast<unsigned long long>(remainingMs),
-                    kDimLeadMs);
-
-                if (HandleDisplayDim()) {
-                    g_agentDimmed = true;
-                    g_agentPreblankInputTick = lastInputTick;
-                    g_agentExpectedWindowsOffTick = now + remainingMs;
-                    Log(L"EARLY VIDEOIDLE DIM succeeded; holding at 50%% until OFF stage");
-                } else {
-                    Log(L"EARLY VIDEOIDLE DIM failed; OFF stage remains armed");
-                }
-            }
-
-            // Stage 2: send OFF well before Windows removes the HDMI picture.
-            if (g_agentDisplayPowerRequestActive &&
-                !g_agentPreblanked &&
-                remainingMs <= kOffLeadMs) {
-
-                Log(L"EARLY VIDEOIDLE OFF: idle=%lu ms timeout=%llu ms remaining=%llu ms lead=%lu ms",
-                    idleMs,
-                    static_cast<unsigned long long>(timeoutMs),
-                    static_cast<unsigned long long>(remainingMs),
-                    kOffLeadMs);
-
-                if (HandleDisplayOff()) {
-                    g_agentPreblanked = true;
-                    if (!g_agentDimmed) {
-                        g_agentPreblankInputTick = lastInputTick;
-                    }
-                    // From this point forward, do not restore merely because a
-                    // power notification says ON. Require LastInputInfo to move.
-                    g_agentAwaitingUserWake = true;
-                    g_agentAutoOffInputTick = lastInputTick;
-                    g_agentExpectedWindowsOffTick = now + remainingMs;
-
-                    if (g_agentDisplayPowerRequestActive) {
-                        g_agentDisplayHoldReleaseTick = now + kFadeGuardAfterOffMs;
-                        Log(L"EARLY VIDEOIDLE OFF succeeded; holding HDMI for another %lu ms while ESP32 fades",
-                            kFadeGuardAfterOffMs);
-                    } else {
-                        Log(L"EARLY VIDEOIDLE OFF succeeded; WARNING: display hold was unavailable");
-                    }
-                    return;
-                }
-
-                Log(L"EARLY VIDEOIDLE OFF DDC write failed; Windows OFF notification remains fallback");
-            }
-        }
-    }
-
-    bool safeToPollBrightness = !g_agentDimmed && !g_agentPreblanked;
-    if (timeoutMs != 0 && idleMs < timeoutMs) {
-        const ULONGLONG remaining = timeoutMs - static_cast<ULONGLONG>(idleMs);
-        if (remaining <= kDimLeadMs + 2000ULL) {
-            safeToPollBrightness = false;
-        }
-    }
-
-    if (safeToPollBrightness &&
+    // While Windows says the session display is ON and we are not performing a
+    // temporary DIM, external/keyboard DDC changes own the brightness.  We only
+    // learn them; we never write the cached value back during normal use.
+    if (g_agentDisplayOn && !g_agentDimmed && !g_agentRestorePending &&
         (g_agentLastBrightnessCacheTick == 0 ||
          now - g_agentLastBrightnessCacheTick >= kBrightnessCacheIntervalMs)) {
         CacheBrightnessIfAvailable();
@@ -1196,197 +1324,163 @@ static void AgentTimerTick()
 
 static void AgentHandleSuspend()
 {
-    Log(L"PBT_APMSUSPEND -> forcing ESP32 backlight OFF before system suspend");
+    if (AgentWindowsSessionIsEnding()) {
+        Log(L"PBT_APMSUSPEND received while Windows session is ending -> brightness frozen; no VCP write");
+        return;
+    }
+
+    Log(L"PBT_APMSUSPEND -> best-effort ESP32 backlight OFF; no sleep hold or delay");
 
     g_agentWasSuspended = true;
-
-    // Never allow our timeout-only display hold to interfere with an explicit
-    // or system suspend transition. PBT_APMSUSPEND is the independent OFF path.
-    ReleaseAgentDisplayHold(L"system suspend");
-
+    g_agentResumeWaitingForUserPresence = true;
     g_agentDisplayOn = false;
     g_agentDimmed = false;
-    g_agentPreblanked = false;
-    g_agentAwaitingUserWake = false;
-    g_agentAutoOffInputTick = 0;
-    g_agentExpectedWindowsOffTick = 0;
-    g_agentPostRequestOffTick = 0;
-    g_agentExternalDisplayRequired = false;
-    g_agentResumeWaitingForUserPresence = false;
+    g_agentAppliedDimBrightness = 0;
+    SaveTemporaryDimState(false, 0);
+    CancelAgentPrediction(L"system suspend", true);
+    CancelAgentRestore(L"system suspend");
 
-    if (HandleDisplayOff()) {
-        Log(L"Suspend OFF write succeeded; holding %lu ms for ESP32 local fade",
-            kSuspendFadeGuardMs);
-        Sleep(kSuspendFadeGuardMs);
-    } else {
-        Log(L"Suspend OFF write failed; system suspend continues");
+    // Do not Sleep() here.  The old one-second fade guard delayed the suspend
+    // callback.  The ESP32 can continue its local fade if power remains, and its
+    // DDC-bus guard is the hardware-side fallback when the laptop powers down.
+    bool offOk = false;
+    for (int attempt = 1; attempt <= 3 && !offOk; ++attempt) {
+        offOk = AgentWriteBrightnessFast(0);
+    }
+    if (!offOk) {
+        Log(L"Suspend OFF write failed; Windows suspend continues unimpeded");
     }
 }
 
 static void AgentHandleResume(const wchar_t* source)
 {
-    Log(L"%s -> system resumed; restoring display brightness", source);
+    Log(L"%s -> user-visible resume accepted", source ? source : L"resume");
 
-    ReleaseAgentDisplayHold(L"system resume");
+    CancelAgentPrediction(L"resume", true);
     g_agentDisplayOn = true;
     g_agentDimmed = false;
-    g_agentPreblanked = false;
-    g_agentAwaitingUserWake = false;
-    g_agentAutoOffInputTick = 0;
-    g_agentPreblankSuppressedUntilInput = false;
-    g_agentExpectedWindowsOffTick = 0;
-    g_agentPostRequestOffTick = 0;
-    g_agentExternalDisplayRequired = false;
-    g_agentResumeWaitingForUserPresence = false;
     g_agentWasSuspended = false;
-
-    HandleDisplayOn();
-}
-
-static const wchar_t* PowerGuidName(const GUID& guid)
-{
-    if (IsEqualGUID(guid, kGuidSessionDisplayStatus)) return L"GUID_SESSION_DISPLAY_STATUS";
-    if (IsEqualGUID(guid, kGuidConsoleDisplayState))  return L"GUID_CONSOLE_DISPLAY_STATE";
-    if (IsEqualGUID(guid, kGuidMonitorPowerOn))       return L"GUID_MONITOR_POWER_ON";
-    if (IsEqualGUID(guid, kGuidLidSwitchStateChange)) return L"GUID_LIDSWITCH_STATE_CHANGE";
-    return L"UNKNOWN_POWER_GUID";
+    g_agentResumeWaitingForUserPresence = false;
+    ScheduleAgentRestore(source ? source : L"resume");
 }
 
 static void AgentApplyDisplayState(DWORD state, const wchar_t* source)
 {
-    Log(L"%s notification: %lu", source, state);
+    if (AgentWindowsSessionIsEnding()) {
+        Log(L"%s notification %lu ignored because Windows session is ending; brightness frozen",
+            source ? source : L"display", state);
+        return;
+    }
+
+    const bool authoritativeSession =
+        source && _wcsicmp(source, L"GUID_SESSION_DISPLAY_STATUS") == 0;
+    const bool firstAuthoritativeSessionState =
+        authoritativeSession && !g_agentSessionStateKnown;
+
+    if (authoritativeSession) {
+        g_agentSessionStateKnown = true;
+        g_agentStartupFallbackDone = true;
+    }
+
+    Log(L"%s notification: %lu", source ? source : L"display", state);
 
     if (state == 0) {
-        const bool alreadyOff = g_agentPreblanked || g_agentAwaitingUserWake;
+        CancelAgentRestore(L"Windows display OFF");
 
-        ReleaseAgentDisplayHold(L"Windows confirmed display OFF");
+        const bool preOffAlreadySent = g_agentPredictionPreOffSent;
+        if (authoritativeSession && g_agentDimStartTick != 0 &&
+            g_agentDimCycleEligibleForLearning) {
+            const ULONGLONG observed = GetTickCount64() - g_agentDimStartTick;
+            LearnDimToOffInterval(observed);
+        }
+
+        CancelAgentPrediction(L"authoritative Windows OFF", false);
+        g_agentDimCycleEligibleForLearning = false;
+        g_agentDimStartTick = 0;
         g_agentDisplayOn = false;
         g_agentDimmed = false;
-        g_agentPreblanked = false;
-        g_agentExpectedWindowsOffTick = 0;
-        g_agentPostRequestOffTick = 0;
+        g_agentAppliedDimBrightness = 0;
+        SaveTemporaryDimState(false, 0);
 
-        if (alreadyOff) {
-            // Preserve g_agentAwaitingUserWake and its LastInputInfo baseline.
-            Log(L"Windows OFF confirmed after early OFF; panel remains latched dark until real user input");
-        } else {
-            DWORD idleMs = 0;
-            DWORD lastInputTick = 0;
-            if (GetSessionIdleState(idleMs, lastInputTick)) {
-                g_agentAwaitingUserWake = true;
-                g_agentAutoOffInputTick = lastInputTick;
-            }
-            HandleDisplayOff();
+        // If predictive pre-OFF already succeeded, do not waste the tiny HDMI
+        // teardown window repeating the same command. Otherwise this is the
+        // authoritative fallback OFF path.
+        if (preOffAlreadySent) {
+            Log(L"Windows OFF arrived after successful predicted pre-OFF; no duplicate VCP write needed");
+            return;
+        }
+
+        bool offOk = false;
+        for (int attempt = 1; attempt <= 3 && !offOk; ++attempt) {
+            offOk = AgentWriteBrightnessFast(0);
+        }
+        if (!offOk) {
+            Log(L"Windows OFF -> cached/fallback DDC write failed; Windows remains authoritative and continues OFF");
         }
         return;
     }
 
     if (state == 1) {
-        /*
-         * v9.9: after a real suspend, trust the authoritative session-display
-         * ON transition as the user-visible wake signal.
-         *
-         * A physical power-button wake can turn the Windows session display on
-         * without updating GetLastInputInfo(), and IsSystemResumeAutomatic()
-         * may still report TRUE early in the resume sequence.  If Windows has
-         * actually turned GUID_SESSION_DISPLAY_STATUS ON after we previously
-         * received PBT_APMSUSPEND, restore immediately.
-         *
-         * Unattended maintenance wakes normally leave the session display OFF,
-         * so they do not hit this path.
-         */
-        if (g_agentWasSuspended &&
-            source &&
-            _wcsicmp(source, L"GUID_SESSION_DISPLAY_STATUS") == 0) {
-            Log(L"Authoritative SESSION display ON after suspend -> accepting power-button/user-visible wake");
-            AgentHandleResume(L"GUID_SESSION_DISPLAY_STATUS after suspend");
+        CancelAgentPrediction(L"Windows display ON", true);
+
+        // During an unattended resume, do not light the panel merely because
+        // background power telemetry changed.  Microsoft sends
+        // PBT_APMRESUMESUSPEND when user activity (including the power button)
+        // makes the wake interactive; GUID_SESSION_USER_PRESENCE is a fallback.
+        if (g_agentResumeWaitingForUserPresence) {
+            Log(L"Display ON received during resume-wait; deferring backlight until user-visible resume/presence");
             return;
         }
 
-        // After an unattended/automatic resume, Windows can produce power/display
-        // telemetry without a person actually waking the machine. Do not light the
-        // panel until Windows says the resume is no longer automatic, user presence
-        // becomes Present, or PBT_APMRESUMESUSPEND arrives.
-        if (g_agentResumeWaitingForUserPresence) {
-            if (IsSystemResumeAutomatic()) {
-                Log(L"Ignoring display ON notification during unattended resume");
-                g_agentDisplayOn = false;
-                return;
-            }
-
-            Log(L"Display ON after resume is now user-active -> wake accepted");
-            g_agentResumeWaitingForUserPresence = false;
-        }
-
-        if (g_agentAwaitingUserWake) {
-            DWORD idleMs = 0;
-            DWORD lastInputTick = 0;
-            if (GetSessionIdleState(idleMs, lastInputTick) &&
-                lastInputTick == g_agentAutoOffInputTick) {
-                Log(L"Ignoring display ON notification: no user input since automatic OFF");
-                g_agentDisplayOn = false;
-                return;
-            }
-
-            Log(L"Display ON coincides with real user input -> wake accepted");
-            g_agentAwaitingUserWake = false;
-            g_agentAutoOffInputTick = 0;
-        }
-
-        // PowerRequestDisplayRequired can itself cause/maintain an ON state while
-        // our intentional DIM stage is in progress.  That ON notification is not
-        // a wake request and must not immediately undo the 50%% dim.
-        if (g_agentDimmed && !g_agentPreblanked &&
-            g_agentDisplayPowerRequestActive) {
-            DWORD idleMs = 0;
-            DWORD lastInputTick = 0;
-            if (GetSessionIdleState(idleMs, lastInputTick) &&
-                lastInputTick == g_agentPreblankInputTick) {
-                Log(L"Ignoring display ON notification during intentional DIM/HDMI-hold sequence");
-                g_agentDisplayOn = true;
-                return;
-            }
-        }
-
-        const bool needsRestore = !g_agentDisplayOn || g_agentDimmed || g_agentPreblanked;
-
-        ReleaseAgentDisplayHold(L"Windows display ON");
+        // First authoritative ON after agent startup is also a crash-recovery
+        // checkpoint. AgentTryRestoreOnce() adopts an already-nonzero external
+        // brightness instead of overwriting it, but restores the saved value if
+        // the ESP32 was left at zero by a previous crash.
+        const bool needsRestore = firstAuthoritativeSessionState ||
+            !g_agentDisplayOn || g_agentDimmed;
         g_agentDisplayOn = true;
-        g_agentDimmed = false;
-        g_agentPreblanked = false;
-        g_agentPreblankSuppressedUntilInput = false;
-        g_agentExpectedWindowsOffTick = 0;
-        g_agentPostRequestOffTick = 0;
 
         if (needsRestore) {
-            HandleDisplayOn();
+            ScheduleAgentRestore(authoritativeSession ?
+                L"Windows SESSION display ON" : L"display ON fallback");
+        } else {
+            g_agentDimmed = false;
+            g_agentAppliedDimBrightness = 0;
+            SaveTemporaryDimState(false, 0);
         }
         return;
     }
 
     if (state == 2) {
-        if (g_agentExternalDisplayRequired) {
-            Log(L"Ignoring DIM notification while external ES_DISPLAY_REQUIRED is active");
+        if (!g_agentDisplayOn || g_agentResumeWaitingForUserPresence || g_agentLidClosed) {
+            Log(L"Windows DIM ignored because the panel is not in a normal ON state");
             return;
         }
 
-        if (g_agentAwaitingUserWake) {
-            Log(L"Ignoring DIM notification while automatic OFF is latched");
+        if (g_agentDimmed) {
+            Log(L"Duplicate Windows DIM notification ignored");
             return;
         }
 
-        if (g_agentDisplayOn && !g_agentPreblanked && !g_agentDimmed) {
-            DWORD idleMs = 0;
-            DWORD lastInputTick = 0;
-            GetSessionIdleState(idleMs, lastInputTick);
-
-            if (HandleDisplayDim()) {
-                g_agentDimmed = true;
-                g_agentPreblankInputTick = lastInputTick;
-                Log(L"DISPLAY DIM event from %s -> temporary 50%% brightness", source);
-            }
+        // Capture a last-second external brightness change, then apply the
+        // configurable temporary DIM. Prediction may begin only from this real
+        // Windows DIM state; raw user-idle time is never used.
+        CacheBrightnessIfAvailable();
+        const DWORD appliedDim = GetTemporaryDimBrightness(g_agentSettings.dimPercent);
+        if (AgentWriteBrightnessFast(appliedDim)) {
+            g_agentDimmed = true;
+            g_agentAppliedDimBrightness = appliedDim;
+            SaveTemporaryDimState(true, appliedDim);
+            Log(L"Windows DIM accepted -> temporary %lu%% of normal (%lu%%)",
+                g_agentSettings.dimPercent, appliedDim);
+            BeginAgentDimCyclePrediction();
+        } else {
+            Log(L"Windows DIM -> VCP dim failed; leaving brightness unchanged (fail open)");
         }
+        return;
     }
+
+    Log(L"Unknown display state %lu ignored", state);
 }
 
 static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1403,37 +1497,25 @@ static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             hwnd, &kGuidMonitorPowerOn, DEVICE_NOTIFY_WINDOW_HANDLE);
         g_agentLidNotify = RegisterPowerSettingNotification(
             hwnd, &kGuidLidSwitchStateChange, DEVICE_NOTIFY_WINDOW_HANDLE);
-
-        // Explicitly opt this hidden desktop process into suspend/resume
-        // notifications. This is important on modern Windows / Modern Standby,
-        // where background desktop processes should not rely only on the
-        // generic WM_POWERBROADCAST delivery path.
         g_agentSuspendResumeNotify = RegisterSuspendResumeNotification(
             hwnd, DEVICE_NOTIFY_WINDOW_HANDLE);
 
-        Log(L"Interactive agent registrations: session=%p presence=%p console=%p legacy=%p lid=%p suspendresume=%p",
+        Log(L"Interactive registrations: session=%p presence=%p console=%p legacy=%p lid=%p suspendresume=%p",
             g_agentSessionNotify, g_agentUserPresenceNotify, g_agentConsoleNotify,
             g_agentLegacyNotify, g_agentLidNotify, g_agentSuspendResumeNotify);
 
         if (!g_agentSessionNotify) {
-            Log(L"Register GUID_SESSION_DISPLAY_STATUS failed: %lu", GetLastError());
+            Log(L"WARNING: Register GUID_SESSION_DISPLAY_STATUS failed: %lu; startup fail-open fallback remains active",
+                GetLastError());
         }
         if (!g_agentUserPresenceNotify) {
-            Log(L"Register GUID_SESSION_USER_PRESENCE failed: %lu", GetLastError());
-        }
-        if (!g_agentConsoleNotify) {
-            Log(L"Register GUID_CONSOLE_DISPLAY_STATE failed: %lu", GetLastError());
-        }
-        if (!g_agentLegacyNotify) {
-            Log(L"Register GUID_MONITOR_POWER_ON failed: %lu", GetLastError());
-        }
-        if (!g_agentLidNotify) {
-            Log(L"Register GUID_LIDSWITCH_STATE_CHANGE failed: %lu", GetLastError());
+            Log(L"WARNING: Register GUID_SESSION_USER_PRESENCE failed: %lu", GetLastError());
         }
         if (!g_agentSuspendResumeNotify) {
-            Log(L"RegisterSuspendResumeNotification failed: %lu", GetLastError());
+            Log(L"WARNING: RegisterSuspendResumeNotification failed: %lu", GetLastError());
         }
 
+        g_agentStartupFallbackTick = GetTickCount64() + kStartupDisplayStateWaitMs;
         SetTimer(hwnd, kAgentTimerId, kAgentTimerPeriodMs, nullptr);
 
         if (RegisterHotKey(hwnd, kPanicHotkeyId,
@@ -1452,21 +1534,15 @@ static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
     case WM_HOTKEY:
         if (wParam == kPanicHotkeyId) {
-            DWORD idleMs = 0;
-            DWORD inputTick = 0;
-            GetSessionIdleState(idleMs, inputTick);
-            Log(L"EMERGENCY HOTKEY -> cancelling all automatic-off state and forcing saved brightness ON");
-            ReleaseAgentDisplayHold(L"emergency hotkey");
+            Log(L"EMERGENCY HOTKEY -> forcing saved brightness ON and cancelling transient state");
             g_agentDisplayOn = true;
             g_agentDimmed = false;
-            g_agentPreblanked = false;
-            g_agentAwaitingUserWake = false;
-            g_agentAutoOffInputTick = 0;
-            g_agentPostRequestOffTick = 0;
-            g_agentExternalDisplayRequired = false;
-            g_agentPreblankSuppressedUntilInput = true;
-            g_agentSuppressionInputTick = inputTick;
-            HandleDisplayOn();
+            g_agentAppliedDimBrightness = 0;
+            SaveTemporaryDimState(false, 0);
+            CancelAgentPrediction(L"emergency hotkey", true);
+            g_agentWasSuspended = false;
+            g_agentResumeWaitingForUserPresence = false;
+            ScheduleAgentRestore(L"emergency hotkey");
             return 0;
         }
         break;
@@ -1478,51 +1554,21 @@ static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
 
         if (wParam == PBT_APMRESUMEAUTOMATIC) {
-            // This event is sent for every resume. IsSystemResumeAutomatic() is the
-            // critical distinction: FALSE means Windows considers the wake user-
-            // initiated (including the physical power button); TRUE means an
-            // unattended timer/device/maintenance wake. A power-button wake does
-            // not necessarily update GetLastInputInfo(), so do not require a key or
-            // touchpad event here.
-            const BOOL automaticResume = IsSystemResumeAutomatic();
-            Log(L"PBT_APMRESUMEAUTOMATIC received; IsSystemResumeAutomatic=%s",
-                automaticResume ? L"TRUE" : L"FALSE");
-
+            Log(L"PBT_APMRESUMEAUTOMATIC -> waiting for user-visible resume/presence");
             g_agentDisplayOn = false;
-
-            if (!automaticResume) {
-                g_agentResumeWaitingForUserPresence = false;
-                AgentHandleResume(L"PBT_APMRESUMEAUTOMATIC user/power-button wake");
-            } else {
-                g_agentResumeWaitingForUserPresence = true;
-                Log(L"Automatic resume reported; waiting for authoritative SESSION display ON, PBT_APMRESUMESUSPEND, or user presence");
-            }
+            g_agentResumeWaitingForUserPresence = true;
             return TRUE;
         }
 
         if (wParam == PBT_APMRESUMESUSPEND) {
-            // Windows documents this as the user-interaction resume notification,
-            // including power-button wake. Keep it as a second independent path in
-            // case a platform reports IsSystemResumeAutomatic() conservatively.
-            g_agentResumeWaitingForUserPresence = false;
-            if (!g_agentDisplayOn) {
-                AgentHandleResume(L"PBT_APMRESUMESUSPEND");
-            } else {
-                Log(L"PBT_APMRESUMESUSPEND received; display already restored");
-            }
+            AgentHandleResume(L"PBT_APMRESUMESUSPEND");
             return TRUE;
         }
 
         if (wParam == PBT_APMRESUMECRITICAL) {
-            const BOOL automaticResume = IsSystemResumeAutomatic();
-            Log(L"PBT_APMRESUMECRITICAL received; IsSystemResumeAutomatic=%s",
-                automaticResume ? L"TRUE" : L"FALSE");
-            g_agentDisplayOn = false;
-            if (!automaticResume) {
-                AgentHandleResume(L"PBT_APMRESUMECRITICAL user wake");
-            } else {
-                g_agentResumeWaitingForUserPresence = true;
-            }
+            // Critical resume means the normal suspend notification sequence was
+            // incomplete.  Fail toward a usable screen rather than risking black.
+            AgentHandleResume(L"PBT_APMRESUMECRITICAL");
             return TRUE;
         }
 
@@ -1531,21 +1577,18 @@ static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
             if (IsEqualGUID(setting->PowerSetting, kGuidSessionDisplayStatus) &&
                 setting->DataLength >= sizeof(DWORD)) {
-                DWORD state = *reinterpret_cast<const DWORD*>(setting->Data);
+                const DWORD state = *reinterpret_cast<const DWORD*>(setting->Data);
                 AgentApplyDisplayState(state, L"GUID_SESSION_DISPLAY_STATUS");
                 return TRUE;
             }
 
             if (IsEqualGUID(setting->PowerSetting, kGuidSessionUserPresence) &&
                 setting->DataLength >= sizeof(DWORD)) {
-                DWORD presence = *reinterpret_cast<const DWORD*>(setting->Data);
+                const DWORD presence = *reinterpret_cast<const DWORD*>(setting->Data);
                 Log(L"GUID_SESSION_USER_PRESENCE notification: %lu", presence);
 
-                // PowerUserPresent == 0. Use this only as a resume fallback; normal
-                // timeout wake continues to use LastInputInfo so presence telemetry
-                // cannot cause a spontaneous re-light.
+                // PowerUserPresent == 0.
                 if (presence == 0 && g_agentResumeWaitingForUserPresence) {
-                    Log(L"User presence confirmed after unattended resume -> restoring panel");
                     AgentHandleResume(L"GUID_SESSION_USER_PRESENCE");
                 }
                 return TRUE;
@@ -1555,31 +1598,35 @@ static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 setting->DataLength >= sizeof(DWORD)) {
                 const DWORD lidState = *reinterpret_cast<const DWORD*>(setting->Data);
                 Log(L"GUID_LIDSWITCH_STATE_CHANGE notification: %lu", lidState);
+
                 if (lidState == 0) {
+                    if (AgentWindowsSessionIsEnding()) {
+                        Log(L"Lid-close notification during shutdown/restart -> brightness frozen; no VCP write");
+                        return TRUE;
+                    }
                     g_agentLidClosed = true;
-                    ReleaseAgentDisplayHold(L"lid closed");
+                    CancelAgentRestore(L"lid closed");
                     g_agentDisplayOn = false;
                     g_agentDimmed = false;
-                    g_agentPreblanked = false;
-                    HandleDisplayOff();
+                    g_agentAppliedDimBrightness = 0;
+                    SaveTemporaryDimState(false, 0);
+                    CancelAgentPrediction(L"lid closed", true);
+                    AgentWriteBrightnessFast(0);
                 } else {
-                    const bool wasClosed = g_agentLidClosed;
                     g_agentLidClosed = false;
-                    if (wasClosed && !g_agentWasSuspended &&
-                        !g_agentResumeWaitingForUserPresence) {
-                        Log(L"Lid opened while system is awake -> restoring panel");
-                        g_agentDisplayOn = true;
-                        HandleDisplayOn();
-                    }
+                    // Do not restore solely because the lid opened.  Windows'
+                    // SESSION display ON notification decides whether the panel
+                    // should actually light.
+                    Log(L"Lid opened -> waiting for Windows SESSION display ON");
                 }
                 return TRUE;
             }
 
             if (IsEqualGUID(setting->PowerSetting, kGuidConsoleDisplayState) &&
                 setting->DataLength >= sizeof(DWORD)) {
-                DWORD state = *reinterpret_cast<const DWORD*>(setting->Data);
+                const DWORD state = *reinterpret_cast<const DWORD*>(setting->Data);
                 if (g_agentSessionNotify) {
-                    Log(L"GUID_CONSOLE_DISPLAY_STATE telemetry-only: %lu (SESSION_DISPLAY_STATUS is authoritative)", state);
+                    Log(L"GUID_CONSOLE_DISPLAY_STATE telemetry-only: %lu", state);
                 } else {
                     AgentApplyDisplayState(state, L"GUID_CONSOLE_DISPLAY_STATE fallback");
                 }
@@ -1588,9 +1635,9 @@ static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
             if (IsEqualGUID(setting->PowerSetting, kGuidMonitorPowerOn) &&
                 setting->DataLength >= sizeof(DWORD)) {
-                DWORD on = *reinterpret_cast<const DWORD*>(setting->Data);
+                const DWORD on = *reinterpret_cast<const DWORD*>(setting->Data);
                 if (g_agentSessionNotify) {
-                    Log(L"GUID_MONITOR_POWER_ON telemetry-only: %lu (SESSION_DISPLAY_STATUS is authoritative)", on);
+                    Log(L"GUID_MONITOR_POWER_ON telemetry-only: %lu", on);
                 } else {
                     AgentApplyDisplayState(on ? 1u : 0u, L"GUID_MONITOR_POWER_ON fallback");
                 }
@@ -1600,13 +1647,27 @@ static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         return TRUE;
 
     case WM_QUERYENDSESSION:
+        // Freeze brightness BEFORE Windows begins sending shutdown/restart
+        // display telemetry. In particular, ignore a SESSION_DISPLAY_STATUS=OFF
+        // that can arrive during shutdown; that OFF is not a normal idle/display
+        // timeout and must not be translated into VCP 0x10=0.
+        g_agentSessionEnding = true;
+        CancelAgentPrediction(L"Windows session ending", true);
+        CancelAgentRestore(L"Windows session ending");
+        Log(L"WM_QUERYENDSESSION -> freezing panel brightness; shutdown/restart display notifications will be ignored");
         return TRUE;
 
     case WM_ENDSESSION:
-        if (wParam && ((static_cast<DWORD_PTR>(lParam) & ENDSESSION_LOGOFF) == 0)) {
-            Log(L"Windows shutdown/restart -> best-effort backlight OFF");
-            ReleaseAgentDisplayHold(L"Windows shutdown/restart");
-            HandleDisplayOff();
+        if (wParam) {
+            // Do not alter panel brightness for shutdown, restart, or sign-out.
+            // Windows may still render shutdown/restart UI, and a restart should
+            // carry the user's current brightness cleanly into the next boot.
+            // The ESP32/laptop hardware-side DDC guard handles final power loss.
+            Log(L"Windows session ending -> panel brightness left unchanged");
+        } else {
+            // Shutdown/restart was cancelled; resume normal display telemetry.
+            g_agentSessionEnding = false;
+            Log(L"WM_ENDSESSION cancelled -> brightness freeze released");
         }
         return 0;
 
@@ -1617,6 +1678,9 @@ static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     case WM_DESTROY:
         KillTimer(hwnd, kAgentTimerId);
         UnregisterHotKey(hwnd, kPanicHotkeyId);
+        CancelAgentPrediction(L"agent shutdown", true);
+        CancelAgentRestore(L"agent shutdown");
+
         if (g_agentSessionNotify) {
             UnregisterPowerSettingNotification(g_agentSessionNotify);
             g_agentSessionNotify = nullptr;
@@ -1641,7 +1705,7 @@ static LRESULT CALLBACK AgentWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             UnregisterSuspendResumeNotification(g_agentSuspendResumeNotify);
             g_agentSuspendResumeNotify = nullptr;
         }
-        CloseAgentDisplayPowerRequest();
+        CloseAgentCachedPhysicalMonitor();
         PostQuitMessage(0);
         return 0;
     }
@@ -1663,17 +1727,36 @@ static int RunInteractiveAgent()
         return 0;
     }
 
-    Log(L"Interactive display-power agent v10 failsafe starting; PID=%lu target=%s",
+    Log(L"Interactive display-power agent v10.8 predictive DIM-to-OFF starting; PID=%lu target=%s",
         GetCurrentProcessId(), kTargetPnpId);
-    Log(L"Timeout sequence: HOLD T-5.5s, DIM 50%% T-5s, OFF T-2.5s, release HOLD after %lu ms",
-        kFadeGuardAfterOffMs);
+    Log(L"Power policy: NO PowerRequest/ExecutionState holds; Windows SESSION DIM is required before any prediction");
+    ReloadPredictionSettings(true);
+    g_agentLastSettingsPollTick = GetTickCount64();
+    Log(L"Display sequence: Windows DIM -> configurable dim + learned pre-OFF; Windows OFF remains authoritative fallback; Windows ON -> non-blocking restore");
 
-    // Prime the restore value and active Windows display timeout while DDC
-    // is unquestionably available.
-    CacheBrightnessIfAvailable();
+    DWORD persistedDim = 0;
+    if (LoadTemporaryDimState(persistedDim)) {
+        g_agentDimmed = true;
+        g_agentAppliedDimBrightness = persistedDim;
+        Log(L"Crash recovery marker found: temporary DIM %lu%% was active", persistedDim);
+    }
+
+    // Learn the current user's brightness if DDC is already available. If a
+    // persisted temporary-DIM marker exists, do not adopt that exact transient
+    // value as the user's normal brightness.
+    DWORD startupCurrent = 0;
+    DWORD startupMaximum = 0;
+    if (ReadCurrentBrightness(startupCurrent, startupMaximum) &&
+        startupCurrent > 0 && startupCurrent <= 100) {
+        if (!g_agentDimmed || startupCurrent != g_agentAppliedDimBrightness) {
+            SaveBrightness(startupCurrent);
+            Log(L"Startup brightness adopted: %lu%%", startupCurrent);
+        } else {
+            Log(L"Startup brightness %lu%% matches persisted temporary DIM; keeping saved normal brightness", startupCurrent);
+        }
+    }
     g_agentLastBrightnessCacheTick = GetTickCount64();
-    RefreshDisplayIdlePolicy(true);
-    g_agentLastPowerPlanRefreshTick = GetTickCount64();
+    RefreshAgentCachedPhysicalMonitor();
 
     const wchar_t kClassName[] = L"ESP32DisplayPowerAgentHiddenWindow";
 
@@ -1706,9 +1789,6 @@ static int RunInteractiveAgent()
         return 11;
     }
 
-    // Deliberately never ShowWindow(): this is a message-only background agent
-    // from the user's perspective, but a normal hidden top-level HWND ensures
-    // power-setting notifications are delivered reliably.
     Log(L"Interactive agent ready; hidden HWND=%p", hwnd);
 
     MSG msg{};
@@ -1834,22 +1914,42 @@ static int ManualProbe()
     return 0;
 }
 
+static int ManualSyncBrightness()
+{
+    DWORD current = 0;
+    DWORD maximum = 0;
+    if (!ReadCurrentBrightness(current, maximum)) {
+        wprintf(L"FAIL: VCP 0x10 could not be read.\n");
+        return 2;
+    }
+
+    if (current == 0 || current > 100) {
+        wprintf(L"Brightness is %lu; not adopting zero/invalid value as the normal restore level.\n", current);
+        return 3;
+    }
+
+    SaveBrightness(current);
+    wprintf(L"Saved current user brightness: %lu\n", current);
+    Log(L"Manual sync adopted current brightness=%lu", current);
+    return 0;
+}
+
 static int ManualOff()
 {
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HandleDisplayOff();
+    const bool ok = HandleDisplayOff();
     CloseHandle(g_stopEvent);
     g_stopEvent = nullptr;
-    return 0;
+    return ok ? 0 : 2;
 }
 
 static int ManualOn()
 {
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HandleDisplayOn();
+    const bool ok = HandleDisplayOn();
     CloseHandle(g_stopEvent);
     g_stopEvent = nullptr;
-    return 0;
+    return ok ? 0 : 2;
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -1857,6 +1957,9 @@ int wmain(int argc, wchar_t** argv)
     if (argc >= 2) {
         if (_wcsicmp(argv[1], L"--probe") == 0) {
             return ManualProbe();
+        }
+        if (_wcsicmp(argv[1], L"--sync") == 0) {
+            return ManualSyncBrightness();
         }
         if (_wcsicmp(argv[1], L"--off") == 0) {
             return ManualOff();
@@ -1881,7 +1984,8 @@ int wmain(int argc, wchar_t** argv)
                 L"This program normally runs as the %s service.\n"
                 L"Manual commands:\n"
                 L"  --probe   resolve AUOD0A2 and read VCP 0x10\n"
-                L"  --off     cache brightness and send VCP 0x10=0\n"
+                L"  --sync    adopt current nonzero VCP 0x10 as restore brightness\n"
+                L"  --off     send VCP 0x10=0\n"
                 L"  --on      restore cached brightness\n"
                 L"  --agent   run hidden interactive display-power agent\n",
                 kServiceName);

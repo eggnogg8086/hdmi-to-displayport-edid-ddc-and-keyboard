@@ -1,0 +1,21 @@
+v10.8.1.1 - Predictive DIM-to-OFF with user INI settings
+====================================================
+
+- Reintroduces anticipatory backlight-off safely: prediction begins ONLY after
+  Windows reports GUID_SESSION_DISPLAY_STATUS = DIM.
+- Never predicts from GetLastInputInfo/raw VIDEOIDLE timeout.
+- Learns the machine's observed Windows DIM->OFF interval with a bounded moving
+  average and stores it in HKLM\SOFTWARE\ESP32BrightnessBridge.
+- User-adjustable hot-reloaded settings.ini in ProgramData.
+- Safest default: RequireLearnedSample=1 makes the first cycle calibration-only.
+- Configurable DimPercent, AdvanceMs, fallback interval, learning bounds, and
+  ES_DISPLAY_REQUIRED veto.
+- A user/third-party DDC brightness change during DIM cancels prediction.
+- Active ES_DISPLAY_REQUIRED at the predicted moment cancels prediction.
+- PreOffConfirmTimeoutMs automatically recovers if Windows does not confirm OFF.
+- Query failures and predictive DDC failures fail open to the real Windows OFF.
+- Actual Windows OFF remains authoritative and provides the learning sample.
+- Sleep/lid/resume/shutdown/cancelled DIM cycles cannot poison learned timing.
+- No Windows power request or execution-state hold is created.
+- Adds Start Menu "Edit Settings" shortcut.
+- Preserves settings.ini across upgrades.

@@ -1,0 +1,22 @@
+v10.7 - Preserve Brightness on Shutdown/Restart
+================================================
+
+Fixes
+-----
+- Removed the WM_ENDSESSION brightness=0 write.
+- Added a WM_QUERYENDSESSION brightness-freeze latch so display OFF/DIM/ON
+  notifications emitted as part of shutdown/restart cannot change VCP 0x10.
+- If shutdown/restart is cancelled (WM_ENDSESSION with FALSE), the latch is
+  released and normal display telemetry resumes.
+- Shutdown, restart, and sign-out now leave VCP 0x10 unchanged.
+- Pending wake/restore retries are cancelled during session teardown without
+  writing any new brightness value.
+- Sleep still sends a best-effort VCP 0x10=0 on PBT_APMSUSPEND.
+- Lid close still sends VCP 0x10=0.
+- A real Windows display-OFF notification still sends VCP 0x10=0.
+- Restart therefore keeps the user's current brightness through the reboot UI
+  and into the next boot.
+- Final physical power-off on shutdown is left to the ESP32/laptop DDC power-loss
+  guard rather than being forced by the Windows application.
+
+No Windows power requests or execution-state holds are used.

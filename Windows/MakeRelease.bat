@@ -7,7 +7,7 @@ rem This script NEVER compiles. Run build.bat first on the developer PC.
 if not exist "build\Esp32DisplayPowerAgent.exe" goto :missing
 if not exist "build\Esp32DisplayPowerBridge.exe" goto :missing
 
-set "NAME=ESP32BrightnessBridge_v10_3"
+set "NAME=ESP32BrightnessBridge_v10_8_1"
 set "RELROOT=%CD%\release"
 set "RELDIR=%RELROOT%\%NAME%"
 set "APPDIR=%RELDIR%\App"
@@ -33,6 +33,8 @@ copy /y "health_check.ps1" "%APPDIR%\" >nul
 copy /y "Emergency Recover.cmd" "%APPDIR%\" >nul
 copy /y "Status.cmd" "%APPDIR%\" >nul
 copy /y "View Log.cmd" "%APPDIR%\" >nul
+copy /y "Edit Settings.cmd" "%APPDIR%\" >nul
+copy /y "settings.ini" "%APPDIR%\" >nul
 copy /y "Uninstall.cmd" "%APPDIR%\Uninstall.cmd" >nul
 copy /y "README_FIRST.txt" "%APPDIR%\README.txt" >nul
 
